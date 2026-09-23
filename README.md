@@ -51,5 +51,3 @@ cargo fmt --all -- --check
 cargo test --locked --offline --all-features
 cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 ```
-
-前期接口探针、权限对照、性能数据和桌面截图保存在相邻的 [`windows-rs-telemetry-lab`](../windows-rs-telemetry-lab/) 旧仓库及 `tmp` 下的独立实验目录。本仓库是从已验证的实现重新初始化的工作项目，Git 历史独立。
