@@ -12,16 +12,15 @@ use std::{
 use windows_reactor::*;
 use windows_rs_telemetry::{
     battery,
-    config::{self, Command, Config},
+    config::{self, Command},
     cpu::CpuUsage,
     history::History,
     network::{self, format_rate},
     nvme,
-    sampling::{MAX_SAMPLE_GAP, Sample, SamplerThread},
-    sources,
+    sampling::{INTERVAL, Latest, MAX_SAMPLE_GAP, Sample, SamplerThread, is_stale},
+    sources::{self, Sources},
 };
 
-const INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_CHECK: Duration = Duration::from_millis(100);
 const BACKGROUND: Color = Color::rgb(10, 18, 32);
 const CARD: Color = Color::rgb(22, 36, 56);
@@ -49,9 +48,11 @@ enum Metric {
 
 impl Metric {
     fn label(&self, stale: bool) -> String {
+        if stale {
+            return "数据已过期".into();
+        }
         match self {
             Self::Pending => "预热中".into(),
-            Self::Value(_) if stale => "数据已过期".into(),
             Self::Value(value) => value.clone(),
             Self::Failed(error) => format!("读取失败：{error}"),
         }
@@ -116,22 +117,30 @@ impl Gauges {
     }
 }
 
-fn start_sampler(config: &Config) -> io::Result<(SamplerThread, Receiver<Sample>, String, String)> {
-    let selected = sources::select(config)?;
-    // 队列只有一个位置；UI 忙碌时跳过新样本，不累积后台工作或过期读数。
+fn start_sampler(
+    selected: &Sources,
+) -> io::Result<(SamplerThread, Receiver<()>, Arc<Latest<Sample>>)> {
+    // 单槽信箱保存最新样本；通知通道也只有一个位置。
+    let latest = Arc::new(Latest::default());
+    let writer = Arc::clone(&latest);
     let (tx, rx) = mpsc::sync_channel(1);
     let sampler = SamplerThread::spawn(
         INTERVAL,
         selected.network_luid,
-        selected.disk,
+        selected.disk.clone(),
         move |sample| {
-            let _ = tx.try_send(sample);
+            writer.publish(sample);
+            let _ = tx.try_send(());
         },
     )?;
-    Ok((sampler, rx, selected.network_name, selected.disk_name))
+    Ok((sampler, rx, latest))
 }
 
-fn schedule_sample(context: &ComponentContext<Preview>, receiver: Arc<Mutex<Receiver<Sample>>>) {
+fn schedule_sample(
+    context: &ComponentContext<TelemetryPage>,
+    receiver: Arc<Mutex<Receiver<()>>>,
+    latest: Arc<Latest<Sample>>,
+) {
     context.spawn_background_with_rejection(
         move |cancel| {
             // 最多占用线程池工作线程一秒；超时消息也会刷新样本年龄。
@@ -140,7 +149,11 @@ fn schedule_sample(context: &ComponentContext<Preview>, receiver: Arc<Mutex<Rece
                     return Message::SamplerStopped;
                 }
                 match receiver.lock().unwrap().recv_timeout(CANCEL_CHECK) {
-                    Ok(sample) => return Message::Sample(Box::new(sample)),
+                    Ok(()) => {
+                        if let Some(sample) = latest.take() {
+                            return Message::Sample(Box::new(sample));
+                        }
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Message::SamplerStopped,
                 }
@@ -151,8 +164,8 @@ fn schedule_sample(context: &ComponentContext<Preview>, receiver: Arc<Mutex<Rece
     );
 }
 
-fn fresh(label: &str, at: Option<Instant>, max_age: Duration, stopped: bool) -> String {
-    if stopped || at.is_some_and(|at| at.elapsed() > max_age) {
+fn fresh(label: &str, stale: bool) -> String {
+    if stale {
         "数据已过期".into()
     } else {
         label.into()
@@ -231,32 +244,34 @@ fn gauge_card(
         )
 }
 
-struct Preview {
+struct TelemetryPage {
     sampler: Option<SamplerThread>,
-    receiver: Option<Arc<Mutex<Receiver<Sample>>>>,
+    receiver: Option<Arc<Mutex<Receiver<()>>>>,
+    latest: Arc<Latest<Sample>>,
     history: History,
     gauges: Option<Gauges>,
     last_sample_at: Option<Instant>,
     error: Option<String>,
 }
 
-impl Component for Preview {
-    type Input = Config;
+impl Component for TelemetryPage {
+    type Input = Sources;
     type Message = Message;
 
-    fn create(input: &Config, context: &ComponentContext<Self>) -> Self {
+    fn create(input: &Sources, context: &ComponentContext<Self>) -> Self {
         match start_sampler(input) {
-            Ok((sampler, receiver, network_name, nvme_name)) => {
+            Ok((sampler, receiver, latest)) => {
                 let receiver = Arc::new(Mutex::new(receiver));
-                schedule_sample(context, Arc::clone(&receiver));
+                schedule_sample(context, Arc::clone(&receiver), Arc::clone(&latest));
                 let history = History {
-                    network_name,
-                    nvme_name,
+                    network_name: input.network_name.clone(),
+                    nvme_name: input.disk_name.clone(),
                     ..History::default()
                 };
                 Self {
                     sampler: Some(sampler),
                     receiver: Some(receiver),
+                    latest,
                     history,
                     gauges: None,
                     last_sample_at: None,
@@ -266,6 +281,7 @@ impl Component for Preview {
             Err(error) => Self {
                 sampler: None,
                 receiver: None,
+                latest: Arc::new(Latest::default()),
                 history: History::default(),
                 gauges: None,
                 last_sample_at: None,
@@ -282,31 +298,35 @@ impl Component for Preview {
                 self.history.push(*sample);
                 self.gauges = Some(gauges);
                 if let Some(receiver) = &self.receiver {
-                    schedule_sample(context, Arc::clone(receiver));
+                    schedule_sample(context, Arc::clone(receiver), Arc::clone(&self.latest));
                 }
             }
             Message::Tick => {
                 if let Some(receiver) = &self.receiver {
-                    schedule_sample(context, Arc::clone(receiver));
+                    schedule_sample(context, Arc::clone(receiver), Arc::clone(&self.latest));
                 }
             }
-            Message::SamplerStopped | Message::DeliveryRejected => {
+            Message::SamplerStopped => {
                 self.receiver = None;
                 self.sampler = None;
-                self.error = Some(match message {
-                    Message::SamplerStopped => "采样线程已停止".into(),
-                    Message::DeliveryRejected => "后台样本投递失败".into(),
-                    _ => unreachable!(),
-                });
+                self.error = Some("采样线程已停止".into());
+            }
+            Message::DeliveryRejected => {
+                self.receiver = None;
+                self.sampler = None;
+                self.error = Some("后台样本投递失败".into());
             }
         }
     }
 
-    fn view(&self, _input: &Config, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &Sources, context: &mut ViewContext<Self>) -> View {
         context.window_title("Telemetry · WinUI");
-        let age = self.last_sample_at.map(|at| at.elapsed());
+        let now = Instant::now();
+        let age = self
+            .last_sample_at
+            .map(|at| now.saturating_duration_since(at));
         let stopped = self.error.is_some();
-        let stale = stopped || age.is_some_and(|age| age > MAX_SAMPLE_GAP);
+        let stale = stopped || is_stale(self.last_sample_at, now, MAX_SAMPLE_GAP);
         let status = if let Some(error) = &self.error {
             error.clone()
         } else if let Some(age) = age {
@@ -342,8 +362,7 @@ impl Component for Preview {
             )
         };
         let network_at = self.history.points.back().map(|point| point.network_at);
-        let network_value = if stopped || network_at.is_some_and(|at| at.elapsed() > MAX_SAMPLE_GAP)
-        {
+        let network_value = if stopped || is_stale(network_at, now, MAX_SAMPLE_GAP) {
             "数据已过期".into()
         } else if let Some(point) = self.history.points.back() {
             match (point.download, point.upload) {
@@ -355,36 +374,19 @@ impl Component for Preview {
         } else {
             "等待采样".into()
         };
-        let battery_value = fresh(
-            &self.history.battery_label,
-            self.history.battery_at,
-            battery::STALE_AFTER,
-            stopped,
-        );
-        let nvme_value = fresh(
-            &self.history.nvme_label,
-            self.history.nvme_at,
-            nvme::STALE_AFTER,
-            stopped,
-        );
-        let disk_value = fresh(
-            &self.history.disk_label,
-            self.history.pdh_at,
-            MAX_SAMPLE_GAP,
-            stopped,
-        );
-        let gpu_value = fresh(
-            &self.history.gpu_label,
-            self.history.pdh_at,
-            MAX_SAMPLE_GAP,
-            stopped,
-        );
-        let nvme_detail = if nvme_value == "数据已过期" {
+        let battery_stale = stopped || is_stale(self.history.battery_at, now, battery::STALE_AFTER);
+        let nvme_stale = stopped || is_stale(self.history.nvme_at, now, nvme::STALE_AFTER);
+        let pdh_stale = stopped || is_stale(self.history.pdh_at, now, MAX_SAMPLE_GAP);
+        let battery_value = fresh(&self.history.battery_label, battery_stale);
+        let nvme_value = fresh(&self.history.nvme_label, nvme_stale);
+        let disk_value = fresh(&self.history.disk_label, pdh_stale);
+        let gpu_value = fresh(&self.history.gpu_label, pdh_stale);
+        let nvme_detail = if nvme_stale {
             format!("{} · 等待新快照", self.history.nvme_name)
         } else {
             format!("{} · {}", self.history.nvme_name, self.history.nvme_detail)
         };
-        let battery_detail = if battery_value == "数据已过期" {
+        let battery_detail = if battery_stale {
             "等待新快照".into()
         } else {
             self.history.battery_detail.clone()
@@ -486,13 +488,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let command = Command::parse(std::env::args().skip(1)).map_err(io::Error::other)?;
     match command {
         Command::Help => println!("{}", config::help("telemetry-reactor")),
-        Command::ListNetwork => network::print_interfaces(None)?,
+        Command::ListNetwork => network::print_interfaces()?,
         Command::ListDisks => {
-            for disk in nvme::list_disks() {
+            for disk in nvme::list_disks()? {
                 println!("{}  {}", disk.path, disk.name);
             }
         }
-        Command::Run(config) => App::run_component::<Preview>(config)?,
+        Command::Run(config) => {
+            let selected = sources::select(&config)?;
+            App::run_component::<TelemetryPage>(selected)?;
+        }
     }
     Ok(())
 }

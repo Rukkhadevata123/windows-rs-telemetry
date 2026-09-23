@@ -3,6 +3,7 @@ use std::io;
 
 use crate::{config::Config, network, nvme};
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sources {
     pub network_luid: Option<u64>,
     pub network_name: String,

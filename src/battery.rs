@@ -6,6 +6,32 @@ use crate::bindings as n;
 pub const INTERVAL: Duration = Duration::from_secs(3);
 pub const STALE_AFTER: Duration = Duration::from_secs(7);
 
+// Windows BOOLEAN 是字节；生成的 bool 字段不能直接承接系统写入的任意字节。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct BatteryStateRaw {
+    ac_online: u8,
+    battery_present: u8,
+    charging: u8,
+    discharging: u8,
+    spare: [u8; 3],
+    tag: u8,
+    max_capacity: u32,
+    remaining_capacity: u32,
+    rate: u32,
+    estimated_time: u32,
+    default_alert1: u32,
+    default_alert2: u32,
+}
+
+const _: () = {
+    assert!(size_of::<BatteryStateRaw>() == size_of::<n::SYSTEM_BATTERY_STATE>());
+    assert!(
+        std::mem::offset_of!(BatteryStateRaw, rate)
+            == std::mem::offset_of!(n::SYSTEM_BATTERY_STATE, Rate)
+    );
+};
+
 #[derive(Debug)]
 pub struct PowerStatus {
     pub ac_online: Option<bool>,
@@ -58,16 +84,19 @@ fn decode_power(raw: n::SYSTEM_POWER_STATUS) -> PowerStatus {
     }
 }
 
-fn decode_flow(raw: n::SYSTEM_BATTERY_STATE) -> BatteryFlow {
+fn decode_flow(raw: BatteryStateRaw) -> BatteryFlow {
     // Windows 声明为 DWORD，但文档要求按 LONG 解读；as i32 保留位模式。
-    let rate = raw.Rate as i32;
-    let direction_matches = (raw.Charging && !raw.Discharging && rate > 0)
-        || (raw.Discharging && !raw.Charging && rate < 0);
+    let rate = raw.rate as i32;
+    let present = raw.battery_present != 0;
+    let charging = raw.charging != 0;
+    let discharging = raw.discharging != 0;
+    let direction_matches =
+        (charging && !discharging && rate > 0) || (discharging && !charging && rate < 0);
     BatteryFlow {
-        present: raw.BatteryPresent,
-        charging: raw.Charging,
-        discharging: raw.Discharging,
-        milliwatts: (raw.BatteryPresent && rate != i32::MIN && direction_matches).then_some(rate),
+        present,
+        charging,
+        discharging,
+        milliwatts: (present && rate != i32::MIN && direction_matches).then_some(rate),
     }
 }
 
@@ -79,15 +108,15 @@ pub fn collect_battery() -> BatterySnapshot {
     } else {
         Err(std::io::Error::last_os_error().to_string())
     };
-    let mut flow = n::SYSTEM_BATTERY_STATE::default();
+    let mut flow = BatteryStateRaw::default();
     // SAFETY：SystemBatteryState 是只读查询，输入为空；输出指针和大小匹配。
     let status = unsafe {
         n::CallNtPowerInformation(
             n::SystemBatteryState,
             null(),
             0,
-            (&mut flow as *mut n::SYSTEM_BATTERY_STATE).cast(),
-            size_of::<n::SYSTEM_BATTERY_STATE>() as u32,
+            (&mut flow as *mut BatteryStateRaw).cast(),
+            size_of::<BatteryStateRaw>() as u32,
         )
     };
     // 此 API 返回 NTSTATUS；不能用 GetLastError 解释它。
@@ -100,7 +129,7 @@ pub fn collect_battery() -> BatterySnapshot {
 }
 
 impl BatterySnapshot {
-    /// CLI 和窗口共用语义；保留插电未充电、没有电池和未知三种区别。
+    /// 保留插电未充电、没有电池和未知三种区别。
     pub fn labels(&self) -> (String, String) {
         let basic = match &self.power {
             Err(e) => format!("电源状态读取失败：{e}"),
@@ -208,20 +237,34 @@ mod tests {
 
     #[test]
     fn signed_power_and_unknown_rate_do_not_become_giant_wattages() {
-        let mut raw = n::SYSTEM_BATTERY_STATE {
-            BatteryPresent: true,
-            Discharging: true,
-            Rate: (-14350_i32) as u32,
+        let mut raw = BatteryStateRaw {
+            battery_present: 1,
+            discharging: 1,
+            rate: (-14350_i32) as u32,
             ..Default::default()
         };
         assert_eq!(decode_flow(raw).milliwatts, Some(-14350));
-        raw.Rate = 0x80000000;
+        raw.rate = 0x80000000;
         assert_eq!(decode_flow(raw).milliwatts, None);
-        raw.Rate = 23000;
-        raw.Discharging = false;
-        raw.Charging = true;
+        raw.rate = 23000;
+        raw.discharging = 0;
+        raw.charging = 1;
         assert_eq!(decode_flow(raw).milliwatts, Some(23000));
-        raw.BatteryPresent = false;
+        raw.battery_present = 0;
         assert_eq!(decode_flow(raw).milliwatts, None);
+    }
+
+    #[test]
+    fn non_boolean_spare_bytes_and_boolean_values_are_safe() {
+        let raw = BatteryStateRaw {
+            battery_present: 255,
+            discharging: 128,
+            spare: [255, 128, 2],
+            rate: (-12000_i32) as u32,
+            ..Default::default()
+        };
+        let flow = decode_flow(raw);
+        assert!(flow.present && flow.discharging);
+        assert_eq!(flow.milliwatts, Some(-12000));
     }
 }

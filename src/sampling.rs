@@ -1,7 +1,7 @@
 use std::{
     io,
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -17,8 +17,13 @@ use crate::{
     pdh,
 };
 
-/// 当前每秒采样：超过 2.5 秒就视为中断，CPU/网络重建基线，曲线也断开。
+pub const INTERVAL: Duration = Duration::from_secs(1);
+/// 超过 2.5 秒就视为中断，CPU/网络重建基线，曲线也断开。
 pub const MAX_SAMPLE_GAP: Duration = Duration::from_millis(2500);
+
+pub fn is_stale(at: Option<Instant>, now: Instant, max_age: Duration) -> bool {
+    at.is_some_and(|at| now.saturating_duration_since(at) > max_age)
+}
 
 /// 一次采样的全部结果。每项各自可能失败，互不影响。
 #[derive(Debug)]
@@ -40,6 +45,26 @@ pub struct Sample {
     pub pdh: Option<(Instant, pdh::Snapshot)>,
 }
 
+/// 单槽信箱：消费者落后时保留最新样本。
+pub struct Latest<T>(Mutex<Option<T>>);
+
+impl<T> Default for Latest<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T> Latest<T> {
+    /// 返回信箱先前是否为空，供调用者决定是否发送唤醒通知。
+    pub fn publish(&self, value: T) -> bool {
+        self.0.lock().unwrap().replace(value).is_none()
+    }
+
+    pub fn take(&self) -> Option<T> {
+        self.0.lock().unwrap().take()
+    }
+}
+
 /// 后台采样线程的句柄。stop() 或离开作用域时，通知线程退出并等它结束。
 pub struct SamplerThread {
     /// 停止信号就是“丢弃发送端”：工作线程的 recv_timeout 会立刻返回 Disconnected。
@@ -57,6 +82,12 @@ impl SamplerThread {
         disk: Option<DiskDevice>,
         mut on_sample: impl FnMut(Sample) + Send + 'static,
     ) -> io::Result<Self> {
+        if interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "采样间隔不能为零",
+            ));
+        }
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
         let handle = thread::Builder::new()
@@ -65,10 +96,12 @@ impl SamplerThread {
                 // CpuSampler 归这个线程独有，不需要锁
                 let mut cpu_sampler = CpuSampler::new();
                 let mut cpu_frequency_sampler = pdh::CpuFrequencySampler::new();
+                let mut cpu_frequency_retry_at = Instant::now() + pdh::RETRY_INTERVAL;
                 let mut network_sampler = NetworkSampler::default();
                 let mut battery: Option<(Instant, Arc<BatterySnapshot>)> = None;
                 let mut nvme: Option<(Instant, Arc<Result<SmartHealth, String>>)> = None;
                 let mut pdh_sampler = pdh::Sampler::new();
+                let mut next_tick = Instant::now();
                 loop {
                     let taken_at = Instant::now();
                     let cpu = match cpu::read_cpu_times() {
@@ -82,6 +115,10 @@ impl SamplerThread {
                         .as_mut()
                         .map_err(|error| error.clone())
                         .and_then(pdh::CpuFrequencySampler::poll);
+                    if cpu_mhz.is_err() && taken_at >= cpu_frequency_retry_at {
+                        cpu_frequency_sampler = pdh::CpuFrequencySampler::new();
+                        cpu_frequency_retry_at = taken_at + pdh::RETRY_INTERVAL;
+                    }
                     let memory = memory::collect_memory();
                     let interfaces = network_luid.map(|_| network::collect_interfaces());
                     let network_at = Instant::now();
@@ -128,9 +165,12 @@ impl SamplerThread {
                         pdh,
                     });
 
-                    // 用“等停止信号，最多等 interval”代替 sleep：
-                    // 停止时不必等满一秒，立即醒来。
-                    match stop_rx.recv_timeout(interval) {
+                    next_tick += interval;
+                    let delay = next_tick.saturating_duration_since(Instant::now());
+                    if delay.is_zero() {
+                        next_tick = Instant::now();
+                    }
+                    match stop_rx.recv_timeout(delay) {
                         Err(RecvTimeoutError::Timeout) => continue,
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -158,5 +198,20 @@ impl Drop for SamplerThread {
         {
             eprintln!("采样线程发生了 panic");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Latest;
+
+    #[test]
+    fn latest_mailbox_replaces_unconsumed_value() {
+        let latest = Latest::default();
+        assert!(latest.publish(1));
+        assert!(!latest.publish(2));
+        assert_eq!(latest.take(), Some(2));
+        assert_eq!(latest.take(), None);
+        assert!(latest.publish(3));
     }
 }

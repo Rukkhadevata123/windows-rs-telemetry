@@ -1,4 +1,4 @@
-//! 纯数据层：保存时间戳和可选值，不依赖窗口/Canvas。
+//! 保存时间戳、曲线数据和显示标签，不依赖窗口/Canvas。
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub const HISTORY_SPAN: Duration = Duration::from_secs(60);
-pub use crate::sampling::MAX_SAMPLE_GAP as MAX_GAP;
+use crate::sampling::MAX_SAMPLE_GAP;
 const MAX_POINTS: usize = 256;
 const GIB: f64 = (1_u64 << 30) as f64;
 
@@ -56,7 +56,7 @@ impl Default for History {
             battery_label: "等待电池采样".into(),
             battery_detail: String::new(),
             nvme_at: None,
-            nvme_name: "未选择".into(),
+            nvme_name: "未选择 NVMe".into(),
             nvme_label: "可用 --list-disks 查看设备".into(),
             nvme_detail: String::new(),
             pdh_at: None,
@@ -71,23 +71,13 @@ impl History {
         if self.points.back().is_some_and(|p| p.at >= sample.taken_at) {
             return; // 不把乱序或重复样本插进时间线。
         }
-        let cpu = match sample.cpu {
+        let (cpu, cpu_label) = match sample.cpu {
             Ok(CpuUsage::Busy(value)) if value.is_finite() && (0.0..=1.0).contains(&value) => {
-                self.cpu_label = format!("{:.1}%", value * 100.0);
-                Some(value)
+                (Some(value), format!("{:.1}%", value * 100.0))
             }
-            Ok(CpuUsage::Pending) => {
-                self.cpu_label = "等待下一次采样".into();
-                None
-            }
-            Ok(_) => {
-                self.cpu_label = "无效读数".into();
-                None
-            }
-            Err(e) => {
-                self.cpu_label = format!("读取失败：{e}");
-                None
-            }
+            Ok(CpuUsage::Pending) => (None, "等待下一次采样".into()),
+            Ok(_) => (None, "无效读数".into()),
+            Err(e) => (None, format!("读取失败：{e}")),
         };
         let frequency = match sample.cpu_mhz {
             Ok(Some(mhz)) if mhz.is_finite() && mhz > 0.0 => {
@@ -97,7 +87,7 @@ impl History {
             Ok(None) => "频率等待基线".into(),
             Err(e) => format!("频率读取失败：{e}"),
         };
-        self.cpu_label = format!("{}  ·  {frequency}", self.cpu_label);
+        self.cpu_label = format!("{cpu_label}  ·  {frequency}");
         let ram = match sample.memory {
             Ok(m) if m.total_bytes > 0 && m.available_bytes <= m.total_bytes => {
                 let ratio = m.used_bytes() as f64 / m.total_bytes as f64;
@@ -228,7 +218,7 @@ impl History {
             if age > HISTORY_SPAN {
                 continue;
             }
-            if previous.is_some_and(|prev| at.saturating_duration_since(prev) > MAX_GAP) {
+            if previous.is_some_and(|prev| at.saturating_duration_since(prev) > MAX_SAMPLE_GAP) {
                 result.push(None);
             }
             result.push(metric(p).map(|v| {

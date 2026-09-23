@@ -33,6 +33,13 @@ const GPU_ENGINES: &str = r"\GPU Engine(*)\Utilization Percentage";
 const CPU_BASE_MHZ: &str = r"\Processor Information(_Total)\Processor Frequency";
 const CPU_PERFORMANCE: &str = r"\Processor Information(_Total)\% Processor Performance";
 const MIN_BASELINE_AGE: Duration = Duration::from_millis(500);
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(30);
+// 这些状态码来自 Windows SDK 的 PdhMsg.h / winerror.h / dxgi.h。
+const PDH_MORE_DATA: u32 = 0x8000_07D2;
+const PDH_CSTATUS_VALID_DATA: u32 = 0;
+const PDH_CSTATUS_NEW_DATA: u32 = 1;
+const DXGI_ERROR_NOT_FOUND: u32 = 0x887A_0002;
+const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DiskRates {
@@ -109,7 +116,7 @@ fn formatted_value(counter: native::PDH_HCOUNTER) -> Result<f64, String> {
             &mut value,
         )
     })?;
-    if value.CStatus > 1 {
+    if value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA {
         return Err(format!("PDH CStatus=0x{:08X}", value.CStatus));
     }
     // SAFETY: 已要求 double 格式，且 CStatus 有效。
@@ -211,18 +218,20 @@ fn adapters() -> Result<Vec<Adapter>, String> {
         unsafe { dxgi::CreateDXGIFactory1() }.map_err(|e| format!("CreateDXGIFactory1: {e:?}"))?;
     let mut result = Vec::new();
     for index in 0..32 {
-        // DXGI_ERROR_NOT_FOUND 表示枚举结束。
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
-            break;
+        // SAFETY: 工厂仍有效；仅在本线程枚举。
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(error) if error.code().0 as u32 == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => return Err(format!("EnumAdapters1: {error:?}")),
         };
         let mut desc = dxgi::DXGI_ADAPTER_DESC1::default();
         // SAFETY: 完整的本地结构体输出。
         unsafe { adapter.GetDesc1(&mut desc) }
             .ok()
             .map_err(|e| format!("GetDesc1: {e:?}"))?;
-        if desc.Flags & 0x2 != 0 {
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE != 0 {
             continue;
-        } // DXGI_ADAPTER_FLAG_SOFTWARE
+        }
         let end = desc
             .Description
             .iter()
@@ -265,24 +274,27 @@ fn name_from_buffer(
 }
 
 fn formatted_array(counter: native::PDH_HCOUNTER) -> Result<Vec<(String, f64)>, String> {
-    let (mut bytes, mut count) = (0_u32, 0_u32);
-    // SAFETY: 空输出仅查询需要的缓冲区大小。
-    let first = unsafe {
-        native::PdhGetFormattedCounterArrayW(
-            counter,
-            native::PDH_FMT_DOUBLE,
-            &mut bytes,
-            &mut count,
-            ptr::null_mut(),
-        )
-    };
-    if bytes == 0 {
-        return Err(format!(
-            "PDH 实例缓冲区大小查询失败：0x{:08X}",
-            first as u32
-        ));
-    }
     for _ in 0..3 {
+        let (mut bytes, mut count) = (0_u32, 0_u32);
+        // SAFETY: 空输出仅查询需要的缓冲区大小。
+        let first = unsafe {
+            native::PdhGetFormattedCounterArrayW(
+                counter,
+                native::PDH_FMT_DOUBLE,
+                &mut bytes,
+                &mut count,
+                ptr::null_mut(),
+            )
+        };
+        if first == 0 && bytes == 0 {
+            return Ok(Vec::new());
+        }
+        if first as u32 != PDH_MORE_DATA || bytes == 0 {
+            return Err(format!(
+                "PDH 实例缓冲区大小查询失败：0x{:08X}",
+                first as u32
+            ));
+        }
         let mut buffer = vec![0_u64; (bytes as usize).div_ceil(size_of::<u64>())];
         let mut available = (buffer.len() * size_of::<u64>()) as u32;
         // SAFETY: u64 缓冲区具有足够对齐，available 是可写容量。
@@ -295,11 +307,10 @@ fn formatted_array(counter: native::PDH_HCOUNTER) -> Result<Vec<(String, f64)>, 
                 buffer.as_mut_ptr().cast(),
             )
         };
+        if code as u32 == PDH_MORE_DATA {
+            continue;
+        }
         if code != 0 {
-            if available > (buffer.len() * size_of::<u64>()) as u32 {
-                bytes = available;
-                continue;
-            }
             return Err(format!(
                 "PdhGetFormattedCounterArrayW: 0x{:08X}",
                 code as u32
@@ -322,7 +333,9 @@ fn formatted_array(counter: native::PDH_HCOUNTER) -> Result<Vec<(String, f64)>, 
         };
         let mut result = Vec::with_capacity(items.len());
         for item in items {
-            if item.FmtValue.CStatus > 1 {
+            if item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA
+                && item.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA
+            {
                 continue;
             }
             // SAFETY: 已要求 double 格式且 CStatus 有效。
@@ -371,6 +384,7 @@ impl GpuQuery {
     fn poll(&self) -> Result<Option<EngineReading>, String> {
         collect(&self.query)?;
         let values = formatted_array(self.counter)?;
+        let has_instances = !values.is_empty();
         let mut matched = 0;
         let mut busiest: Option<EngineReading> = None;
         for (name, percent) in values {
@@ -396,7 +410,11 @@ impl GpuQuery {
             }
         }
         if matched == 0 {
-            Err("没有匹配 DXGI 物理适配器的 GPU Engine 实例".into())
+            if has_instances {
+                Err("没有匹配 DXGI 物理适配器的 GPU Engine 实例".into())
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(busiest)
         }
@@ -408,6 +426,8 @@ pub struct Sampler {
     last_poll: Instant,
     disk: Result<DiskQuery, String>,
     gpu: Result<GpuQuery, String>,
+    disk_retry_at: Instant,
+    gpu_retry_at: Instant,
 }
 
 impl Default for Sampler {
@@ -426,6 +446,8 @@ impl Sampler {
             last_poll: started,
             disk,
             gpu,
+            disk_retry_at: started + RETRY_INTERVAL,
+            gpu_retry_at: started + RETRY_INTERVAL,
         }
     }
 
@@ -447,18 +469,25 @@ impl Sampler {
             return None;
         }
         self.last_poll = now;
-        Some(Snapshot {
-            disk: self
-                .disk
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(DiskQuery::poll),
-            gpu: self
-                .gpu
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(GpuQuery::poll),
-        })
+        let disk = self
+            .disk
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(DiskQuery::poll);
+        let gpu = self
+            .gpu
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(GpuQuery::poll);
+        if disk.is_err() && now >= self.disk_retry_at {
+            self.disk = DiskQuery::new();
+            self.disk_retry_at = now + RETRY_INTERVAL;
+        }
+        if gpu.is_err() && now >= self.gpu_retry_at {
+            self.gpu = GpuQuery::new();
+            self.gpu_retry_at = now + RETRY_INTERVAL;
+        }
+        Some(Snapshot { disk, gpu })
     }
 }
 
@@ -477,5 +506,22 @@ mod tests {
             None
         );
         assert_eq!(parse_instance("pid_3_engtype_"), None);
+    }
+
+    #[test]
+    fn instance_name_stays_within_returned_buffer() {
+        let mut buffer = [0_u64; 2];
+        let name = buffer.as_mut_ptr().cast::<u16>();
+        // SAFETY: buffer 以 u64 对齐，前两个 u16 落在已分配的 16 字节内。
+        unsafe {
+            name.write('A' as u16);
+            name.add(1).write(0);
+        }
+        assert_eq!(name_from_buffer(&buffer, 4, name).unwrap(), "A");
+        let unaligned = (name as usize + 1) as *const u16;
+        assert!(name_from_buffer(&buffer, 4, unaligned).is_err());
+        let outside = (name as usize + 16) as *const u16;
+        assert!(name_from_buffer(&buffer, 4, outside).is_err());
+        assert!(name_from_buffer(&buffer, 2, name).is_err());
     }
 }

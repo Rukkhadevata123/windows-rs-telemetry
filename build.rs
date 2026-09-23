@@ -1,5 +1,6 @@
 // 构建时从 Windows 元数据生成窄绑定，只包含过滤清单里的 API 及其依赖类型。
-// 生成结果位于 target/debug/build/windows-rs-telemetry-*/out/bindings.rs
+// 生成结果位于 Cargo 提供的 OUT_DIR。PDH 使用 C 风格句柄，DXGI 使用 COM 接口，
+// 因此分别生成绑定以免混用模式。
 fn main() {
     let out = std::env::var("OUT_DIR").unwrap();
     windows_bindgen::bindgen([
@@ -11,7 +12,6 @@ fn main() {
         "--sys",
         "--filter",
         "GlobalMemoryStatusEx",
-        "GetLastError",
         "GetSystemTimes",
         // 基础电池状态及电池侧充放电功率。
         "GetSystemPowerStatus",
@@ -29,6 +29,8 @@ fn main() {
         "EndPaint",
         "GetClientRect",
         "GetDpiForWindow",
+        "SystemParametersInfoW",
+        "SPI_GETWORKAREA",
         "IsIconic",
         "SetWindowPos",
         "SWP_NOZORDER",

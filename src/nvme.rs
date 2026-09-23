@@ -11,7 +11,7 @@ const DEVICE_BUFFER_BYTES: usize = 4096;
 const SMART_LOG_PAGE: u32 = 2;
 const MAX_DRIVE_INDEX: u32 = 64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskDevice {
     pub path: String,
     pub name: String,
@@ -45,7 +45,7 @@ struct Handle(*mut c_void);
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY：只包装 CreateFileW 成功返回的独占句柄。
+        // SAFETY：唯一拥有 CreateFileW 成功返回的句柄；释放一次。
         unsafe { n::CloseHandle(self.0) };
     }
 }
@@ -161,17 +161,30 @@ fn query_device(handle: &Handle) -> io::Result<Option<String>> {
     parse_device(bytes)
 }
 
-pub fn list_disks() -> Vec<DiskDevice> {
+pub fn list_disks() -> io::Result<Vec<DiskDevice>> {
     let mut disks = Vec::new();
+    let mut first_error = None;
     for index in 0..MAX_DRIVE_INDEX {
         let path = format!(r"\\.\PhysicalDrive{index}");
-        if let Ok(handle) = open(&path)
-            && let Ok(Some(name)) = query_device(&handle)
-        {
-            disks.push(DiskDevice { path, name });
+        match open(&path) {
+            Ok(handle) => match query_device(&handle) {
+                Ok(Some(name)) => disks.push(DiskDevice { path, name }),
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            },
+            Err(error) if matches!(error.raw_os_error(), Some(2 | 3)) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    disks
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(disks)
+    }
 }
 
 pub fn select_disk(requested_path: Option<&str>) -> io::Result<Option<DiskDevice>> {
@@ -194,7 +207,7 @@ pub fn select_disk(requested_path: Option<&str>) -> io::Result<Option<DiskDevice
             name,
         }));
     }
-    let disks = list_disks();
+    let disks = list_disks()?;
     Ok(if disks.len() == 1 {
         disks.into_iter().next()
     } else {

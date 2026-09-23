@@ -84,7 +84,7 @@ fn utf16(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..end])
 }
 
-pub fn print_interfaces(requested_name: Option<&str>) -> io::Result<()> {
+pub fn print_interfaces() -> io::Result<()> {
     let interfaces = collect_interfaces()?;
     println!("网络接口快照：累计字节，不是实时速度\n");
     for interface in &interfaces {
@@ -102,7 +102,7 @@ pub fn print_interfaces(requested_name: Option<&str>) -> io::Result<()> {
             interface.received_bytes, interface.sent_bytes
         );
     }
-    if let Some(interface) = select_interface(&interfaces, requested_name)? {
+    if let Some(interface) = select_interface(&interfaces, None)? {
         println!(
             "\n本次选择：{}（{}），LUID={:#018x}",
             interface.name, interface.description, interface.luid
@@ -122,11 +122,12 @@ pub fn select_interface<'a>(
         .filter(|i| i.is_hardware && i.is_wifi)
         .collect();
     let selected = if let Some(name) = requested_name {
+        let normalized = name.to_lowercase();
         Some(
             candidates
                 .iter()
                 .copied()
-                .find(|i| i.name == name)
+                .find(|i| i.name.to_lowercase() == normalized)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -219,6 +220,41 @@ impl NetworkSampler {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn interface(name: &str, luid: u64, hardware: bool) -> InterfaceSnapshot {
+        InterfaceSnapshot {
+            luid,
+            index: luid as u32,
+            name: name.into(),
+            description: name.into(),
+            is_hardware: hardware,
+            is_wifi: true,
+            is_up: true,
+            status: "Up",
+            received_bytes: 0,
+            sent_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn selection_requires_unique_physical_wifi_unless_named() {
+        let interfaces = [
+            interface("WLAN", 1, true),
+            interface("Wi-Fi 2", 2, true),
+            interface("Virtual", 3, false),
+        ];
+        assert!(select_interface(&interfaces, None).unwrap().is_none());
+        assert_eq!(
+            select_interface(&interfaces, Some("wlan"))
+                .unwrap()
+                .unwrap()
+                .luid,
+            1
+        );
+        assert!(select_interface(&interfaces, Some("virtual")).is_err());
+        assert!(select_interface(&interfaces[..1], None).unwrap().is_some());
+        assert!(select_interface(&[], None).unwrap().is_none());
+    }
 
     #[test]
     fn rate_uses_elapsed_time_and_reconnection_rewarms() {

@@ -1,4 +1,4 @@
-use crate::bindings::{FILETIME, GetLastError, GetSystemTimes};
+use crate::bindings::{FILETIME, GetSystemTimes};
 use crate::sampling::MAX_SAMPLE_GAP;
 use std::time::Instant;
 
@@ -25,8 +25,7 @@ pub fn read_cpu_times() -> std::io::Result<CpuTimes> {
     // SAFETY：三个指针都指向本函数栈上的有效 FILETIME，只在本次调用期间使用。
     let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
     if ok == 0 {
-        let code = unsafe { GetLastError() };
-        return Err(std::io::Error::from_raw_os_error(code as i32));
+        return Err(std::io::Error::last_os_error());
     }
 
     Ok(CpuTimes {

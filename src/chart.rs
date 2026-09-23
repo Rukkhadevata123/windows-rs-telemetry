@@ -1,17 +1,20 @@
 //! Canvas 只读历史模型；尺寸是 DIP，交换链尺寸是物理像素。
 use std::{ffi::c_void, time::Instant};
 use windows_canvas::{
-    Brush, ColorF, DrawingSession, Ellipse, GpuDevice, Rect, Result, SwapChain, TextFormat, Vector2,
+    Brush, ColorF, DrawingSession, Ellipse, GpuDevice, Matrix3x2, Rect, Result, SwapChain,
+    TextFormat, Vector2,
 };
 
-use windows_rs_telemetry::history::{History, MAX_GAP};
+use windows_rs_telemetry::history::History;
 use windows_rs_telemetry::network::format_rate;
+use windows_rs_telemetry::sampling::{MAX_SAMPLE_GAP, is_stale};
 
 pub struct Renderer {
     // 交换链先于设备释放。
     chain: SwapChain,
     _device: GpuDevice,
     fonts: Fonts,
+    scaled_fonts: Option<(f32, Fonts)>,
     dpi: u32,
 }
 
@@ -21,12 +24,22 @@ pub struct Fonts {
     small: TextFormat,
 }
 
+const PANEL_TOP: f32 = 306.0;
+const FOOTER_SPACE: f32 = 28.0;
+const MIN_PLOT_HEIGHT: f32 = 60.0;
+const NETWORK_PLOT_INSET: f32 = 84.0;
+const MIN_HEIGHT: f32 = PANEL_TOP + FOOTER_SPACE + 3.0 * (NETWORK_PLOT_INSET + MIN_PLOT_HEIGHT);
+
 impl Fonts {
     pub fn new() -> Result<Self> {
+        Self::scaled(1.0)
+    }
+
+    fn scaled(scale: f32) -> Result<Self> {
         Ok(Self {
-            title: TextFormat::new_bold("Microsoft YaHei UI", 22.0)?,
-            body: TextFormat::new("Microsoft YaHei UI", 14.0)?,
-            small: TextFormat::new("Microsoft YaHei UI", 11.0)?,
+            title: TextFormat::new_bold("Microsoft YaHei UI", 22.0 / scale)?,
+            body: TextFormat::new("Microsoft YaHei UI", 14.0 / scale)?,
+            small: TextFormat::new("Microsoft YaHei UI", 11.0 / scale)?,
         })
     }
 }
@@ -44,6 +57,7 @@ impl Renderer {
             chain,
             _device: device,
             fonts: Fonts::new()?,
+            scaled_fonts: None,
             dpi,
         })
     }
@@ -63,16 +77,27 @@ impl Renderer {
             self.chain.set_dpi(dpi as f32, dpi as f32);
             self.dpi = dpi;
         }
+        let dip_width = width as f32 * 96.0 / dpi as f32;
+        let dip_height = height as f32 * 96.0 / dpi as f32;
+        let scale = dip_height / MIN_HEIGHT;
+        if dip_width >= 500.0 && dip_height >= 500.0 && scale < 1.0 {
+            if self
+                .scaled_fonts
+                .as_ref()
+                .is_none_or(|(cached, _)| (cached - scale).abs() > 0.01)
+            {
+                self.scaled_fonts = Some((scale, Fonts::scaled(scale)?));
+            }
+        } else {
+            self.scaled_fonts = None;
+        }
         {
             let session = self.chain.begin_draw()?;
-            draw(
-                &session,
-                &self.fonts,
-                width as f32 * 96.0 / dpi as f32,
-                height as f32 * 96.0 / dpi as f32,
-                history,
-                now,
-            )?;
+            let fonts = self
+                .scaled_fonts
+                .as_ref()
+                .map_or(&self.fonts, |(_, fonts)| fonts);
+            draw(&session, fonts, dip_width, dip_height, history, now)?;
         } // Drop 调用 EndDraw；结束绘制后才能 Present。
         self.chain.present() // false 是设备丢失，不是成功呈现。
     }
@@ -91,6 +116,147 @@ pub fn draw(
     history: &History,
     now: Instant,
 ) -> Result<()> {
+    if width < 500.0 || height < 500.0 {
+        return draw_compact(session, fonts, width, height, history, now);
+    }
+    if height < MIN_HEIGHT {
+        let scale = height / MIN_HEIGHT;
+        let previous = session.transform();
+        session.set_transform(&Matrix3x2 {
+            m11: previous.m11 * scale,
+            m12: previous.m12 * scale,
+            m21: previous.m21 * scale,
+            m22: previous.m22 * scale,
+            m31: previous.m31,
+            m32: previous.m32,
+        });
+        let result = draw_full(session, fonts, width / scale, MIN_HEIGHT, history, now);
+        session.set_transform(&previous);
+        return result;
+    }
+    draw_full(session, fonts, width, height, history, now)
+}
+
+fn draw_compact(
+    session: &DrawingSession<'_>,
+    fonts: &Fonts,
+    width: f32,
+    height: f32,
+    history: &History,
+    now: Instant,
+) -> Result<()> {
+    session.clear(ColorF::rgb(0.035, 0.055, 0.09));
+    let text = session.create_solid_brush(ColorF::rgb(0.89, 0.93, 0.98))?;
+    let muted = session.create_solid_brush(ColorF::rgb(0.53, 0.62, 0.73))?;
+    session.draw_text(
+        "系统监控",
+        &fonts.title,
+        &Rect::from_xywh(20.0, 14.0, (width - 40.0).max(1.0), 36.0),
+        &text,
+    );
+    let latest = history.points.back();
+    let sample_stale = latest.is_some_and(|point| is_stale(Some(point.at), now, MAX_SAMPLE_GAP));
+    let network_stale =
+        latest.is_some_and(|point| is_stale(Some(point.network_at), now, MAX_SAMPLE_GAP));
+    let network =
+        latest.and_then(|point| (!network_stale).then_some((point.download?, point.upload?)));
+    let network_label = if network_stale {
+        "数据已过期".into()
+    } else {
+        network.map_or_else(
+            || history.network_status.clone(),
+            |(down, up)| format!("↓ {}  ↑ {}", format_rate(down), format_rate(up)),
+        )
+    };
+    let pdh_stale = is_stale(history.pdh_at, now, MAX_SAMPLE_GAP);
+    let lines = [
+        format!(
+            "CPU  {}",
+            if sample_stale {
+                "数据已过期"
+            } else {
+                &history.cpu_label
+            }
+        ),
+        format!(
+            "内存  {}",
+            if sample_stale {
+                "数据已过期"
+            } else {
+                &history.ram_label
+            }
+        ),
+        format!("WLAN  {network_label}"),
+        format!(
+            "磁盘  {}",
+            if pdh_stale {
+                "数据已过期"
+            } else {
+                &history.disk_label
+            }
+        ),
+        format!(
+            "GPU  {}",
+            if pdh_stale {
+                "数据已过期"
+            } else {
+                &history.gpu_label
+            }
+        ),
+        format!(
+            "NVMe  {}",
+            if is_stale(
+                history.nvme_at,
+                now,
+                windows_rs_telemetry::nvme::STALE_AFTER
+            ) {
+                "数据已过期"
+            } else {
+                &history.nvme_label
+            }
+        ),
+        format!(
+            "电池  {}",
+            if is_stale(
+                history.battery_at,
+                now,
+                windows_rs_telemetry::battery::STALE_AFTER
+            ) {
+                "数据已过期"
+            } else {
+                &history.battery_label
+            }
+        ),
+    ];
+    let row_height = ((height - 65.0) / lines.len() as f32).clamp(24.0, 40.0);
+    for (index, line) in lines.iter().enumerate() {
+        let y = 62.0 + index as f32 * row_height;
+        if y >= height {
+            break;
+        }
+        session.draw_text(
+            line,
+            &fonts.body,
+            &Rect::from_xywh(
+                20.0,
+                y,
+                (width - 40.0).max(1.0),
+                (row_height - 4.0).max(1.0),
+            ),
+            if index % 2 == 0 { &text } else { &muted },
+        );
+    }
+    Ok(())
+}
+
+fn draw_full(
+    session: &DrawingSession<'_>,
+    fonts: &Fonts,
+    width: f32,
+    height: f32,
+    history: &History,
+    now: Instant,
+) -> Result<()> {
     session.clear(ColorF::rgb(0.035, 0.055, 0.09));
     let text = session.create_solid_brush(ColorF::rgb(0.89, 0.93, 0.98))?;
     let muted = session.create_solid_brush(ColorF::rgb(0.53, 0.62, 0.73))?;
@@ -99,33 +265,26 @@ pub fn draw(
     let ram = session.create_solid_brush(ColorF::rgb(0.48, 0.86, 0.65))?;
     let download_brush = session.create_solid_brush(ColorF::rgb(0.70, 0.56, 1.0))?;
     let upload_brush = session.create_solid_brush(ColorF::rgb(1.0, 0.66, 0.30))?;
-    let heading = "系统监控 / CPU + RAM + WLAN + 电池 + NVMe + PDH";
+    let heading = "系统监控";
     session.draw_text(
         heading,
         &fonts.title,
         &Rect::from_xywh(24.0, 18.0, width - 48.0, 34.0),
         &text,
     );
-    if width < 500.0 || height < 600.0 {
-        session.draw_text(
-            "放大窗口以查看最近 60 秒曲线",
-            &fonts.body,
-            &Rect::from_xywh(24.0, 65.0, (width - 48.0).max(1.0), 60.0),
-            &muted,
-        );
-        return Ok(());
-    }
     session.draw_text(
-        "曲线：最近 60 秒 / 每秒采样  ·  电池 3 秒  ·  NVMe 30 秒  ·  PDH 约 1 秒",
+        "曲线：最近 60 秒 / 每秒采样  ·  电池 3 秒  ·  NVMe 30 秒  ·  磁盘/GPU 约 1 秒",
         &fonts.small,
         &Rect::from_xywh(24.0, 54.0, width - 48.0, 20.0),
         &muted,
     );
 
     // 电池慢速刷新，只显示快照，不在 60 秒曲线上伪造平滑变化。
-    let battery_stale = history.battery_at.is_some_and(|at| {
-        now.saturating_duration_since(at) > windows_rs_telemetry::battery::STALE_AFTER
-    });
+    let battery_stale = is_stale(
+        history.battery_at,
+        now,
+        windows_rs_telemetry::battery::STALE_AFTER,
+    );
     let basic = if battery_stale {
         "电池数据已过期，等待新样本"
     } else {
@@ -154,9 +313,11 @@ pub fn draw(
         &Rect::from_xywh(24.0, 140.0, width - 48.0, 20.0),
         &muted,
     );
-    let nvme_stale = history.nvme_at.is_some_and(|at| {
-        now.saturating_duration_since(at) > windows_rs_telemetry::nvme::STALE_AFTER
-    });
+    let nvme_stale = is_stale(
+        history.nvme_at,
+        now,
+        windows_rs_telemetry::nvme::STALE_AFTER,
+    );
     let nvme_label = if nvme_stale {
         "数据已过期，等待新样本"
     } else {
@@ -180,9 +341,7 @@ pub fn draw(
             &muted,
         );
     }
-    let pdh_stale = history
-        .pdh_at
-        .is_some_and(|at| now.saturating_duration_since(at) > MAX_GAP);
+    let pdh_stale = is_stale(history.pdh_at, now, MAX_SAMPLE_GAP);
     let disk_label = if pdh_stale {
         "数据已过期"
     } else {
@@ -211,12 +370,12 @@ pub fn draw(
         &Rect::from_xywh(24.0, 275.0, width - 48.0, 20.0),
         &muted,
     );
-    let panel_top = 306.0;
-    let panel_height = (height - panel_top - 28.0) / 3.0;
+    let panel_top = PANEL_TOP;
+    let panel_height = (height - panel_top - FOOTER_SPACE) / 3.0;
     let stale = history
         .points
         .back()
-        .is_none_or(|p| now.saturating_duration_since(p.at) > MAX_GAP);
+        .is_none_or(|p| is_stale(Some(p.at), now, MAX_SAMPLE_GAP));
     for (index, name, label, color, series) in [
         (
             0,
@@ -266,7 +425,7 @@ pub fn draw(
     let stale_network = history
         .points
         .back()
-        .is_none_or(|p| now.saturating_duration_since(p.network_at) > MAX_GAP);
+        .is_none_or(|p| is_stale(Some(p.network_at), now, MAX_SAMPLE_GAP));
     let status = if stale_network && !history.points.is_empty() {
         "数据已过期"
     } else {
@@ -439,10 +598,22 @@ mod tests {
     #[test]
     fn renders_to_warp_at_normal_compact_and_high_dpi_sizes() -> Result<()> {
         let device = GpuDevice::new_warp()?;
-        let fonts = Fonts::new()?;
         let now = Instant::now();
         let history = render_history(now);
-        for (width, height, scale) in [(900, 640, 1.0_f32), (320, 240, 1.0), (1800, 1280, 2.0)] {
+        for (width, height, scale) in [
+            (900, 800, 1.0_f32),
+            (900, 640, 1.0),
+            (450, 400, 1.0),
+            (320, 240, 1.0),
+            (1800, 1280, 2.0),
+            (1800, 1600, 2.0),
+        ] {
+            let dip_height = height as f32 / scale;
+            let fonts = if (500.0..MIN_HEIGHT).contains(&dip_height) {
+                Fonts::scaled(dip_height / MIN_HEIGHT)?
+            } else {
+                Fonts::new()?
+            };
             let target = device.create_render_target(width, height)?;
             target.draw(|session| {
                 session.set_transform(&windows_canvas::Matrix3x2 {

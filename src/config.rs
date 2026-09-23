@@ -74,7 +74,7 @@ pub fn help(binary: &str) -> String {
            --disk 路径       选择 NVMe 物理磁盘\n\
            --list-network    列出网络接口\n\
            --list-disks      列出 NVMe 磁盘\n\
-           --help            显示帮助"
+           --help, -h        显示帮助"
     )
 }
 
@@ -106,6 +106,16 @@ mod tests {
                 interface: Some("WLAN".into()),
                 disk: None
             })
+        );
+    }
+
+    #[test]
+    fn actions_cannot_be_combined_with_other_actions_or_sources() {
+        assert_eq!(Command::parse(["-h".into()]).unwrap(), Command::Help);
+        assert!(Command::parse(["--help".into(), "--list-disks".into()]).is_err());
+        assert!(
+            Command::parse(["--list-network".into(), "--interface".into(), "WLAN".into(),])
+                .is_err()
         );
     }
 }

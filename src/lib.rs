@@ -1,5 +1,6 @@
 //! 两个窗口入口共用的遥测采集与历史模型。
 pub mod battery;
+#[doc(hidden)]
 pub mod bindings;
 pub mod config;
 pub mod cpu;

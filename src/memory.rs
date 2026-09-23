@@ -1,4 +1,4 @@
-use crate::bindings::{GetLastError, GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use crate::bindings::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 /// 对外暴露的 Rust 类型：不泄漏任何 Win32 结构体。
 #[derive(Debug, Clone, Copy)]
@@ -29,8 +29,7 @@ pub fn collect_memory() -> std::io::Result<MemorySnapshot> {
     // 返回值是 BOOL（i32）：非零表示成功。只有失败时才读取线程的“最后错误”，
     // 成功时它的值没有意义。这不是 HRESULT，也不是直接返回的错误码。
     if ok == 0 {
-        let code = unsafe { GetLastError() };
-        return Err(std::io::Error::from_raw_os_error(code as i32));
+        return Err(std::io::Error::last_os_error());
     }
 
     Ok(MemorySnapshot {
