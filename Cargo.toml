@@ -1,0 +1,29 @@
+[package]
+name = "windows-rs-telemetry"
+version = "0.1.0"
+edition = "2024"
+default-run = "windows-rs-telemetry"
+
+[features]
+reactor = ["dep:windows-reactor"]
+
+[dependencies]
+# --sys 模式生成的绑定用 windows_link::link! 宏声明外部函数
+windows-link = "=0.100.0"
+# 创建 Win32 窗口、运行消息循环。
+windows-window = "=0.100.0"
+windows-canvas = "=0.100.0"
+# windows-window 以 default-features = false 引用它，错误类型因此没有实现 std::error::Error。
+# 直接依赖一次（默认开启 std feature），Cargo 的 feature 合并会为整个依赖图打开它。
+windows-result = "=0.100.0"
+# DXGI 生成绑定只需 COM 基础类型；不启用未使用的实现/接口过程宏。
+windows-core = { version = "=0.100.0", default-features = false }
+windows-reactor = { version = "=0.100.0", optional = true }
+
+[build-dependencies]
+windows-bindgen = "=0.100.0"
+
+[[bin]]
+name = "telemetry-reactor"
+path = "src/bin/telemetry_reactor.rs"
+required-features = ["reactor"]
