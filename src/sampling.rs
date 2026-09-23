@@ -18,17 +18,21 @@ use crate::{
 };
 
 pub const INTERVAL: Duration = Duration::from_secs(1);
-/// 超过 2.5 秒就视为中断，CPU/网络重建基线，曲线也断开。
+/// 约 2.5 个采样周期；超过就视为中断，CPU/网络重建基线，曲线也断开。
 pub const MAX_SAMPLE_GAP: Duration = Duration::from_millis(2500);
 
 pub fn is_stale(at: Option<Instant>, now: Instant, max_age: Duration) -> bool {
     at.is_some_and(|at| now.saturating_duration_since(at) > max_age)
 }
 
+/// 慢速数据源从未读取过，或距上次读取已满一个周期。
+fn is_due(last: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= interval)
+}
+
 /// 一次采样的全部结果。每项各自可能失败，互不影响。
 #[derive(Debug)]
 pub struct Sample {
-    /// 单调时钟：不受系统时间调整影响，只用来算间隔
     pub taken_at: Instant,
     pub cpu: io::Result<CpuUsage>,
     /// 与利用率独立的 PDH 估算频率，单位 MHz；None 表示等待基线或没有有效值。
@@ -67,15 +71,13 @@ impl<T> Latest<T> {
 
 /// 后台采样线程的句柄。stop() 或离开作用域时，通知线程退出并等它结束。
 pub struct SamplerThread {
-    /// 停止信号就是“丢弃发送端”：工作线程的 recv_timeout 会立刻返回 Disconnected。
-    /// 通道里从来不真正发送数据。
+    /// 丢弃发送端即停止信号：工作线程的 recv_timeout 立刻返回 Disconnected。
     stop_tx: Option<mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SamplerThread {
-    /// on_sample 在采样线程上被调用，所以要求 Send + 'static：
-    /// 它会被移动到另一个线程，并且可能比当前函数活得更久。
+    /// on_sample 在采样线程上调用。
     pub fn spawn(
         interval: Duration,
         network_luid: Option<u64>,
@@ -91,9 +93,9 @@ impl SamplerThread {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
         let handle = thread::Builder::new()
-            .name("sampler".into()) // 调试器和 panic 信息里能看到这个名字
+            .name("sampler".into())
             .spawn(move || {
-                // CpuSampler 归这个线程独有，不需要锁
+                // 所有采样器和 PDH 查询都只在这个线程创建和使用。
                 let mut cpu_sampler = CpuSampler::new();
                 let mut cpu_frequency_sampler = pdh::CpuFrequencySampler::new();
                 let mut cpu_frequency_retry_at = Instant::now() + pdh::RETRY_INTERVAL;
@@ -133,19 +135,17 @@ impl SamplerThread {
                             Err(error)
                         }
                     };
-                    let battery_now = Instant::now();
-                    if battery
-                        .as_ref()
-                        .is_none_or(|(at, _)| battery_now.duration_since(*at) >= battery::INTERVAL)
-                    {
+                    let slow_now = Instant::now();
+                    if is_due(
+                        battery.as_ref().map(|(at, _)| *at),
+                        slow_now,
+                        battery::INTERVAL,
+                    ) {
                         let snapshot = battery::collect_battery();
-                        let at = Instant::now();
-                        battery = Some((at, Arc::new(snapshot)));
+                        battery = Some((Instant::now(), Arc::new(snapshot)));
                     }
                     if let Some(device) = disk.as_ref()
-                        && nvme
-                            .as_ref()
-                            .is_none_or(|(at, _)| at.elapsed() >= nvme::INTERVAL)
+                        && is_due(nvme.as_ref().map(|(at, _)| *at), slow_now, nvme::INTERVAL)
                     {
                         let reading = nvme::collect_health(device).map_err(|e| e.to_string());
                         nvme = Some((Instant::now(), Arc::new(reading)));
@@ -183,7 +183,7 @@ impl SamplerThread {
         })
     }
 
-    /// 显式停止。真正的工作在 Drop 里，这里只是让意图更清楚。
+    /// 等价于 drop，只是让调用点意图更清楚。
     pub fn stop(self) {
         drop(self);
     }
@@ -191,7 +191,7 @@ impl SamplerThread {
 
 impl Drop for SamplerThread {
     fn drop(&mut self) {
-        // 顺序很重要：先发信号，再 join。反过来会永远等下去。
+        // 先发停止信号再 join。
         drop(self.stop_tx.take());
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()

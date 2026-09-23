@@ -4,6 +4,7 @@ pub mod battery;
 pub mod bindings;
 pub mod config;
 pub mod cpu;
+pub mod format;
 pub mod history;
 pub mod memory;
 pub mod network;

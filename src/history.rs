@@ -1,4 +1,4 @@
-//! 保存时间戳、曲线数据和显示标签，不依赖窗口/Canvas。
+//! 保存时间戳、曲线数据、结构化最新读数和慢速指标的显示标签，不依赖窗口/Canvas。
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -6,14 +6,54 @@ use std::{
 
 use crate::{
     cpu::CpuUsage,
-    network::{NetworkUsage, format_rate},
-    sampling::Sample,
+    format,
+    network::NetworkUsage,
+    sampling::{MAX_SAMPLE_GAP, Sample},
+    sources::Sources,
 };
 
 pub const HISTORY_SPAN: Duration = Duration::from_secs(60);
-use crate::sampling::MAX_SAMPLE_GAP;
 const MAX_POINTS: usize = 256;
-const GIB: f64 = (1_u64 << 30) as f64;
+pub const PENDING_LABEL: &str = "等待采样";
+pub const STALE_LABEL: &str = "数据已过期";
+
+/// 过期时统一替换成 STALE_LABEL，不再展示旧值。
+pub fn unless_stale(label: &str, stale: bool) -> &str {
+    if stale { STALE_LABEL } else { label }
+}
+
+/// 最近一次读数。校验只在 push 时做一次，前端只负责格式化。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Metric<T> {
+    Pending,
+    Value(T),
+    Failed(String),
+}
+
+impl<T> Metric<T> {
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self, format: impl FnOnce(&T) -> String) -> String {
+        match self {
+            Self::Pending => PENDING_LABEL.into(),
+            Self::Value(value) => format(value),
+            Self::Failed(error) => format!("读取失败：{error}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MemoryUse {
+    /// 0..1
+    pub ratio: f64,
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+}
 
 #[derive(Clone, Copy)]
 pub struct Reading {
@@ -28,8 +68,10 @@ pub struct Reading {
 
 pub struct History {
     pub points: VecDeque<Reading>,
-    pub cpu_label: String,
-    pub ram_label: String,
+    /// 0..1 的总利用率。
+    pub cpu: Metric<f64>,
+    pub cpu_mhz: Metric<f64>,
+    pub memory: Metric<MemoryUse>,
     pub network_name: String,
     pub network_status: String,
     pub battery_at: Option<Instant>,
@@ -48,10 +90,11 @@ impl Default for History {
     fn default() -> Self {
         Self {
             points: VecDeque::new(),
-            cpu_label: "等待采样".into(),
-            ram_label: "等待采样".into(),
+            cpu: Metric::Pending,
+            cpu_mhz: Metric::Pending,
+            memory: Metric::Pending,
             network_name: "未选择 WLAN".into(),
-            network_status: "等待采样".into(),
+            network_status: PENDING_LABEL.into(),
             battery_at: None,
             battery_label: "等待电池采样".into(),
             battery_detail: String::new(),
@@ -66,68 +109,102 @@ impl Default for History {
     }
 }
 
+fn cpu_metric(sample: &Sample) -> Metric<f64> {
+    match &sample.cpu {
+        Ok(CpuUsage::Busy(ratio)) if ratio.is_finite() && (0.0..=1.0).contains(ratio) => {
+            Metric::Value(*ratio)
+        }
+        Ok(CpuUsage::Pending) => Metric::Pending,
+        Ok(CpuUsage::Busy(_)) => Metric::Failed("无效读数".into()),
+        Err(error) => Metric::Failed(error.to_string()),
+    }
+}
+
+fn frequency_metric(sample: &Sample) -> Metric<f64> {
+    match &sample.cpu_mhz {
+        Ok(Some(mhz)) if mhz.is_finite() && *mhz > 0.0 => Metric::Value(*mhz),
+        Ok(Some(_)) => Metric::Failed("无效频率".into()),
+        Ok(None) => Metric::Pending,
+        Err(error) => Metric::Failed(error.clone()),
+    }
+}
+
+fn memory_metric(sample: &Sample) -> Metric<MemoryUse> {
+    match &sample.memory {
+        Ok(m) if m.total_bytes > 0 && m.available_bytes <= m.total_bytes => {
+            Metric::Value(MemoryUse {
+                ratio: m.used_bytes() as f64 / m.total_bytes as f64,
+                used_bytes: m.used_bytes(),
+                total_bytes: m.total_bytes,
+            })
+        }
+        Ok(_) => Metric::Failed("无效容量".into()),
+        Err(error) => Metric::Failed(error.to_string()),
+    }
+}
+
 impl History {
+    /// 设备名的占位文案只在这里决定。
+    pub fn for_sources(sources: &Sources) -> Self {
+        let mut history = Self::default();
+        if let Some(name) = &sources.network_name {
+            history.network_name.clone_from(name);
+        }
+        if let Some(disk) = &sources.disk {
+            history.nvme_name.clone_from(&disk.name);
+        }
+        history
+    }
+
+    pub fn last_sample_at(&self) -> Option<Instant> {
+        self.points.back().map(|point| point.at)
+    }
+
+    pub fn cpu_label(&self) -> String {
+        let frequency = match &self.cpu_mhz {
+            Metric::Value(mhz) => format!("估算频率 {}", format::ghz(*mhz)),
+            Metric::Pending => "频率等待基线".into(),
+            Metric::Failed(error) => format!("频率读取失败：{error}"),
+        };
+        format!(
+            "{}  ·  {frequency}",
+            self.cpu.label(|ratio| format::percent(*ratio))
+        )
+    }
+
+    pub fn ram_label(&self) -> String {
+        self.memory.label(|m| {
+            format!(
+                "{}  ·  {}",
+                format::percent(m.ratio),
+                format::gib_pair(m.used_bytes, m.total_bytes)
+            )
+        })
+    }
+
     pub fn push(&mut self, sample: Sample) {
         if self.points.back().is_some_and(|p| p.at >= sample.taken_at) {
             return; // 不把乱序或重复样本插进时间线。
         }
-        let (cpu, cpu_label) = match sample.cpu {
-            Ok(CpuUsage::Busy(value)) if value.is_finite() && (0.0..=1.0).contains(&value) => {
-                (Some(value), format!("{:.1}%", value * 100.0))
-            }
-            Ok(CpuUsage::Pending) => (None, "等待下一次采样".into()),
-            Ok(_) => (None, "无效读数".into()),
-            Err(e) => (None, format!("读取失败：{e}")),
-        };
-        let frequency = match sample.cpu_mhz {
-            Ok(Some(mhz)) if mhz.is_finite() && mhz > 0.0 => {
-                format!("估算频率 {:.2} GHz", mhz / 1000.0)
-            }
-            Ok(Some(_)) => "频率无效".into(),
-            Ok(None) => "频率等待基线".into(),
-            Err(e) => format!("频率读取失败：{e}"),
-        };
-        self.cpu_label = format!("{cpu_label}  ·  {frequency}");
-        let ram = match sample.memory {
-            Ok(m) if m.total_bytes > 0 && m.available_bytes <= m.total_bytes => {
-                let ratio = m.used_bytes() as f64 / m.total_bytes as f64;
-                self.ram_label = format!(
-                    "{:.1}%  ·  {:.2} / {:.2} GiB",
-                    ratio * 100.0,
-                    m.used_bytes() as f64 / GIB,
-                    m.total_bytes as f64 / GIB
-                );
-                Some(ratio)
-            }
-            Ok(_) => {
-                self.ram_label = "无效容量".into();
-                None
-            }
-            Err(e) => {
-                self.ram_label = format!("读取失败：{e}");
-                None
-            }
-        };
-        let (download, upload) = match sample.network {
+        self.cpu = cpu_metric(&sample);
+        self.cpu_mhz = frequency_metric(&sample);
+        self.memory = memory_metric(&sample);
+        let (status, download, upload) = match sample.network {
             Ok(NetworkUsage::Transfer {
                 download_bytes_per_sec,
                 upload_bytes_per_sec,
-            }) => {
-                self.network_status.clear();
-                (Some(download_bytes_per_sec), Some(upload_bytes_per_sec))
-            }
-            other => {
-                self.network_status = match other {
-                    Ok(NetworkUsage::NotSelected) => "未选择接口".into(),
-                    Ok(NetworkUsage::Pending) => "等待下一次采样".into(),
-                    Ok(NetworkUsage::Disconnected) => "接口未连接".into(),
-                    Ok(NetworkUsage::Unavailable) => "接口不在场".into(),
-                    Err(error) => format!("读取失败：{error}"),
-                    Ok(NetworkUsage::Transfer { .. }) => unreachable!(),
-                };
-                (None, None)
-            }
+            }) => (
+                String::new(),
+                Some(download_bytes_per_sec),
+                Some(upload_bytes_per_sec),
+            ),
+            Ok(NetworkUsage::NotSelected) => ("未选择接口".into(), None, None),
+            Ok(NetworkUsage::Pending) => ("等待下一次采样".into(), None, None),
+            Ok(NetworkUsage::Disconnected) => ("接口未连接".into(), None, None),
+            Ok(NetworkUsage::Unavailable) => ("接口不在场".into(), None, None),
+            Err(error) => (format!("读取失败：{error}"), None, None),
         };
+        self.network_status = status;
         if let Some((at, battery)) = sample.battery
             && self.battery_at.is_none_or(|previous| at > previous)
         {
@@ -151,8 +228,8 @@ impl History {
             self.disk_label = match snapshot.disk {
                 Ok(rates) => format!(
                     "读 {}  ·  写 {}",
-                    format_rate(rates.read_bps),
-                    format_rate(rates.write_bps)
+                    format::rate(rates.read_bps),
+                    format::rate(rates.write_bps)
                 ),
                 Err(error) => format!("读取失败：{error}"),
             };
@@ -167,8 +244,8 @@ impl History {
         }
         self.points.push_back(Reading {
             at: sample.taken_at,
-            cpu,
-            ram,
+            cpu: self.cpu.value().copied(),
+            ram: self.memory.value().map(|m| m.ratio),
             network_at: sample.network_at,
             download,
             upload,
@@ -345,7 +422,35 @@ mod tests {
         assert!(h.points[0].cpu.is_none());
         assert!(h.points[0].ram.is_some());
         h.push(demo_sample(now - Duration::from_secs(1), 1));
-        assert!(h.cpu_label.contains("probe failed"));
+        assert!(h.cpu_label().contains("probe failed"));
         assert_eq!(h.points.len(), 1);
+    }
+
+    #[test]
+    fn latest_values_are_validated_once_and_names_fall_back_to_placeholders() {
+        let now = Instant::now();
+        let mut h = History::for_sources(&Sources {
+            network_luid: None,
+            network_name: None,
+            disk: Some(crate::nvme::DiskDevice {
+                path: r"\\.\PhysicalDrive0".into(),
+                name: "TEST NVMe".into(),
+            }),
+        });
+        assert_eq!(h.network_name, "未选择 WLAN");
+        assert_eq!(h.nvme_name, "TEST NVMe");
+        assert_eq!(h.cpu_label(), "等待采样  ·  频率等待基线");
+        let mut sample = demo_sample(now, 0);
+        sample.cpu = Ok(CpuUsage::Busy(1.5));
+        sample.memory = Ok(crate::memory::MemorySnapshot {
+            total_bytes: 4 << 30,
+            available_bytes: 3 << 30,
+        });
+        h.push(sample);
+        assert!(matches!(h.cpu, Metric::Failed(_)) && h.points[0].cpu.is_none());
+        assert_eq!(h.ram_label(), "25.0%  ·  1.00 / 4.00 GiB");
+        assert_eq!(h.points[0].ram, Some(0.25));
+        assert_eq!(h.last_sample_at(), Some(now));
+        assert_eq!(unless_stale("x", true), STALE_LABEL);
     }
 }

@@ -11,12 +11,10 @@ pub struct CpuTimes {
     pub user: u64,
 }
 
-/// FILETIME 把一个 64 位数拆成高低两个 u32，这里拼回去。
 fn filetime_to_u64(ft: FILETIME) -> u64 {
     (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
 }
 
-/// 采集层：只负责调用 API，不做任何计算。
 pub fn read_cpu_times() -> std::io::Result<CpuTimes> {
     let mut idle = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -44,8 +42,7 @@ pub enum CpuUsage {
     Busy(f64),
 }
 
-/// 计算层：有状态，记住上一次的累计值，把“累计量”变成“区间内的比例”。
-/// 这里不碰任何 Windows API，所以可以用手造的数据测试。
+/// 记住上一次的累计值，把累计量换算成区间内的利用率。
 #[derive(Debug, Default)]
 pub struct CpuSampler {
     last: Option<(CpuTimes, Instant)>,

@@ -1,5 +1,5 @@
 //! 只读 NVMe SMART 查询。设备描述符用于运行时选盘，不保存序列号。
-use std::{ffi::c_void, io, mem::size_of, ptr, time::Duration};
+use std::{ffi::c_void, io, ptr, time::Duration};
 
 use crate::bindings as n;
 
@@ -56,10 +56,20 @@ fn invalid(message: &'static str) -> io::Error {
 
 fn open(path: &str) -> io::Result<Handle> {
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-    // 零 desired access、共享读写，只用于设备属性查询。
+    // 零 desired access、共享读写，只用于设备属性查询，不需要管理员权限。
     // SAFETY：路径以 NUL 结尾且在调用期间有效；其余可选指针允许为空。
-    let raw = unsafe { n::CreateFileW(wide.as_ptr(), 0, 3, ptr::null(), 3, 0, ptr::null_mut()) };
-    if raw as isize == -1 {
+    let raw = unsafe {
+        n::CreateFileW(
+            wide.as_ptr(),
+            0,
+            (n::FILE_SHARE_READ | n::FILE_SHARE_WRITE) as u32,
+            ptr::null(),
+            n::OPEN_EXISTING as u32,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if raw == n::INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
     Ok(Handle(raw))
@@ -68,7 +78,7 @@ fn open(path: &str) -> io::Result<Handle> {
 fn read_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
     let raw: [u8; 4] = bytes
         .get(at..at + 4)
-        .ok_or_else(|| invalid("truncated device descriptor"))?
+        .ok_or_else(|| invalid("设备描述符被截断"))?
         .try_into()
         .expect("four byte slice");
     Ok(u32::from_le_bytes(raw))
@@ -80,23 +90,23 @@ fn descriptor_string(bytes: &[u8], at: u32) -> io::Result<String> {
     }
     let rest = bytes
         .get(at as usize..)
-        .ok_or_else(|| invalid("device string offset outside descriptor"))?;
+        .ok_or_else(|| invalid("设备字符串偏移超出描述符"))?;
     let end = rest
         .iter()
         .position(|&byte| byte == 0)
-        .ok_or_else(|| invalid("unterminated device string"))?;
+        .ok_or_else(|| invalid("设备字符串缺少终止符"))?;
     Ok(String::from_utf8_lossy(&rest[..end]).trim().to_owned())
 }
 
 fn parse_device(bytes: &[u8]) -> io::Result<Option<String>> {
     let minimum = std::mem::offset_of!(n::STORAGE_DEVICE_DESCRIPTOR, RawDeviceProperties);
     if bytes.len() < minimum {
-        return Err(invalid("device descriptor shorter than fixed fields"));
+        return Err(invalid("设备描述符短于固定字段"));
     }
     let version = read_u32(bytes, 0)? as usize;
     let size = read_u32(bytes, 4)? as usize;
     if version < minimum || size < minimum || size > bytes.len() {
-        return Err(invalid("invalid device descriptor version or size"));
+        return Err(invalid("设备描述符版本或大小无效"));
     }
     let bus = read_u32(
         bytes,
@@ -154,7 +164,7 @@ fn query_device(handle: &Handle) -> io::Result<Option<String>> {
         return Err(io::Error::last_os_error());
     }
     if returned as usize > DEVICE_BUFFER_BYTES {
-        return Err(invalid("device returned more bytes than output buffer"));
+        return Err(invalid("设备返回的字节数超过输出缓冲区"));
     }
     // SAFETY：前 returned 字节由成功的同步 DeviceIoControl 初始化。
     let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast(), returned as usize) };
@@ -166,39 +176,51 @@ pub fn list_disks() -> io::Result<Vec<DiskDevice>> {
     let mut first_error = None;
     for index in 0..MAX_DRIVE_INDEX {
         let path = format!(r"\\.\PhysicalDrive{index}");
-        match open(&path) {
-            Ok(handle) => match query_device(&handle) {
-                Ok(Some(name)) => disks.push(DiskDevice { path, name }),
-                Ok(None) => {}
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            },
-            Err(error) if matches!(error.raw_os_error(), Some(2 | 3)) => {}
+        match open(&path).and_then(|handle| query_device(&handle)) {
+            Ok(Some(name)) => disks.push(DiskDevice { path, name }),
+            Ok(None) => {}
+            Err(error) if is_missing_drive(&error) => {}
             Err(error) => {
                 first_error.get_or_insert(error);
             }
         }
     }
-    if let Some(error) = first_error {
-        Err(error)
-    } else {
-        Ok(disks)
+    scan_result(disks, first_error)
+}
+
+/// 编号不连续是正常的：不存在的 PhysicalDriveN 返回“找不到文件/路径”。
+fn is_missing_drive(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(n::ERROR_FILE_NOT_FOUND | n::ERROR_PATH_NOT_FOUND)
+    )
+}
+
+/// 个别盘查询失败不影响其它盘；一块 NVMe 都没找到时才报告第一个错误。
+fn scan_result(
+    disks: Vec<DiskDevice>,
+    first_error: Option<io::Error>,
+) -> io::Result<Vec<DiskDevice>> {
+    match first_error {
+        Some(error) if disks.is_empty() => Err(error),
+        _ => Ok(disks),
+    }
+}
+
+fn validate_drive_path(path: &str) -> io::Result<()> {
+    let lower = path.to_ascii_lowercase();
+    match lower.strip_prefix(r"\\.\physicaldrive") {
+        Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            r"需要 \\.\PhysicalDriveN 路径",
+        )),
     }
 }
 
 pub fn select_disk(requested_path: Option<&str>) -> io::Result<Option<DiskDevice>> {
     if let Some(path) = requested_path {
-        let lower = path.to_ascii_lowercase();
-        let suffix = lower.strip_prefix(r"\\.\physicaldrive").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "需要 PhysicalDrive 路径")
-        })?;
-        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "需要 PhysicalDrive 路径",
-            ));
-        }
+        validate_drive_path(path)?;
         let handle = open(path)?;
         let name = query_device(&handle)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "指定路径不是 NVMe 盘"))?;
@@ -218,7 +240,7 @@ pub fn select_disk(requested_path: Option<&str>) -> io::Result<Option<DiskDevice
 fn parse_smart(bytes: &[u8]) -> io::Result<SmartHealth> {
     let descriptor_size = size_of::<n::STORAGE_PROTOCOL_DATA_DESCRIPTOR>();
     if bytes.len() < descriptor_size {
-        return Err(invalid("response shorter than protocol descriptor"));
+        return Err(invalid("响应短于协议描述符"));
     }
     // SAFETY：长度足够；字节切片不保证对齐，所以用 read_unaligned。
     let descriptor = unsafe {
@@ -226,33 +248,33 @@ fn parse_smart(bytes: &[u8]) -> io::Result<SmartHealth> {
     };
     if descriptor.Version as usize != descriptor_size || descriptor.Size as usize != descriptor_size
     {
-        return Err(invalid("unexpected protocol descriptor version or size"));
+        return Err(invalid("协议描述符版本或大小不符"));
     }
     let protocol = descriptor.ProtocolSpecificData;
     if protocol.ProtocolType != n::ProtocolTypeNvme
         || protocol.DataType != n::NVMeDataTypeLogPage as u32
     {
-        return Err(invalid("response is not an NVMe log page"));
+        return Err(invalid("响应不是 NVMe 日志页"));
     }
     let protocol_start =
         std::mem::offset_of!(n::STORAGE_PROTOCOL_DATA_DESCRIPTOR, ProtocolSpecificData);
     let offset = protocol.ProtocolDataOffset as usize;
     if offset < size_of::<n::STORAGE_PROTOCOL_SPECIFIC_DATA>() {
-        return Err(invalid("protocol data overlaps descriptor"));
+        return Err(invalid("协议数据与描述符重叠"));
     }
     let start = protocol_start
         .checked_add(offset)
-        .ok_or_else(|| invalid("protocol data offset overflow"))?;
+        .ok_or_else(|| invalid("协议数据偏移溢出"))?;
     let end = start
         .checked_add(protocol.ProtocolDataLength as usize)
-        .ok_or_else(|| invalid("protocol data length overflow"))?;
+        .ok_or_else(|| invalid("协议数据长度溢出"))?;
     if (protocol.ProtocolDataLength as usize) < SMART_LOG_BYTES || end > bytes.len() {
-        return Err(invalid("SMART log missing or truncated"));
+        return Err(invalid("SMART 日志缺失或被截断"));
     }
     let log = &bytes[start..start + SMART_LOG_BYTES];
     let kelvin = u16::from_le_bytes([log[1], log[2]]);
     if kelvin == 0 {
-        return Err(invalid("SMART composite temperature is not reported"));
+        return Err(invalid("SMART 未报告综合温度"));
     }
     Ok(SmartHealth {
         critical_warning: log[0],
@@ -263,30 +285,42 @@ fn parse_smart(bytes: &[u8]) -> io::Result<SmartHealth> {
     })
 }
 
+/// STORAGE_PROPERTY_QUERY 的变长尾部 AdditionalParameters 在这里就是协议请求。
+#[repr(C)]
+struct SmartQuery {
+    property_id: n::STORAGE_PROPERTY_ID,
+    query_type: n::STORAGE_QUERY_TYPE,
+    protocol: n::STORAGE_PROTOCOL_SPECIFIC_DATA,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(SmartQuery, protocol)
+            == std::mem::offset_of!(n::STORAGE_PROPERTY_QUERY, AdditionalParameters)
+    );
+    assert!(size_of::<SmartQuery>() <= BUFFER_BYTES);
+    assert!(align_of::<SmartQuery>() <= align_of::<u64>());
+};
+
 pub fn collect_health(device: &DiskDevice) -> io::Result<SmartHealth> {
     let handle = open(&device.path)?;
-    let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
-    let buffer = storage.as_mut_ptr().cast::<u8>();
-    let query = buffer.cast::<n::STORAGE_PROPERTY_QUERY>();
-    // SAFETY：缓冲区对齐且大于两个结构体；只请求 NVMe SMART 日志页。
-    unsafe {
-        (*query).PropertyId = n::StorageDeviceProtocolSpecificProperty;
-        (*query).QueryType = n::PropertyStandardQuery;
-        let specific = buffer
-            .add(std::mem::offset_of!(
-                n::STORAGE_PROPERTY_QUERY,
-                AdditionalParameters
-            ))
-            .cast::<n::STORAGE_PROTOCOL_SPECIFIC_DATA>();
-        *specific = n::STORAGE_PROTOCOL_SPECIFIC_DATA {
+    let query = SmartQuery {
+        property_id: n::StorageDeviceProtocolSpecificProperty,
+        query_type: n::PropertyStandardQuery,
+        protocol: n::STORAGE_PROTOCOL_SPECIFIC_DATA {
             ProtocolType: n::ProtocolTypeNvme,
             DataType: n::NVMeDataTypeLogPage as u32,
             ProtocolDataRequestValue: SMART_LOG_PAGE,
             ProtocolDataOffset: size_of::<n::STORAGE_PROTOCOL_SPECIFIC_DATA>() as u32,
             ProtocolDataLength: SMART_LOG_BYTES as u32,
             ..Default::default()
-        };
-    }
+        },
+    };
+    // 按微软 NVMe 示例的做法，输入输出共用一块缓冲区：请求在开头，响应覆盖写回。
+    let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+    let buffer = storage.as_mut_ptr().cast::<u8>();
+    // SAFETY：上面的常量断言保证大小和对齐都满足。
+    unsafe { buffer.cast::<SmartQuery>().write(query) };
     let mut returned = 0_u32;
     // SAFETY：输入/输出均指向完整的可写缓冲区，调用同步完成。
     let ok = unsafe {
@@ -305,7 +339,7 @@ pub fn collect_health(device: &DiskDevice) -> io::Result<SmartHealth> {
         return Err(io::Error::last_os_error());
     }
     if returned as usize > BUFFER_BYTES {
-        return Err(invalid("driver reported more bytes than output buffer"));
+        return Err(invalid("驱动报告的字节数超过输出缓冲区"));
     }
     // SAFETY：成功调用初始化 returned 字节。
     let bytes = unsafe { std::slice::from_raw_parts(buffer, returned as usize) };
@@ -360,6 +394,7 @@ mod tests {
         assert!(parse_smart(&bytes[..100]).is_err());
         let mut broken = descriptor;
         broken.ProtocolSpecificData.ProtocolDataOffset = 900;
+        // SAFETY：同上。
         unsafe {
             ptr::write_unaligned(
                 bytes
@@ -388,5 +423,34 @@ mod tests {
         assert!(parse_device(&bytes).is_err());
         bytes[bus..bus + 4].copy_from_slice(&0_u32.to_le_bytes());
         assert!(parse_device(&bytes).unwrap().is_none());
+    }
+
+    #[test]
+    fn drive_path_requires_physical_drive_number() {
+        assert!(validate_drive_path(r"\\.\PhysicalDrive0").is_ok());
+        assert!(validate_drive_path(r"\\.\physicaldrive12").is_ok());
+        assert!(validate_drive_path(r"\\.\PhysicalDrive").is_err());
+        assert!(validate_drive_path(r"\\.\PhysicalDrive1a").is_err());
+        assert!(validate_drive_path(r"\\.\C:").is_err());
+        assert!(validate_drive_path("PhysicalDrive0").is_err());
+    }
+
+    #[test]
+    fn scan_keeps_found_disks_despite_other_errors() {
+        let disk = DiskDevice {
+            path: r"\\.\PhysicalDrive1".into(),
+            name: "TEST".into(),
+        };
+        let denied = || Some(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            scan_result(vec![disk.clone()], denied()).unwrap(),
+            vec![disk]
+        );
+        assert!(scan_result(Vec::new(), denied()).is_err());
+        assert!(scan_result(Vec::new(), None).unwrap().is_empty());
+        assert!(is_missing_drive(&io::Error::from_raw_os_error(
+            n::ERROR_FILE_NOT_FOUND
+        )));
+        assert!(!is_missing_drive(&io::Error::from_raw_os_error(5)));
     }
 }

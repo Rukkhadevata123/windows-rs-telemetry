@@ -5,9 +5,16 @@ use windows_canvas::{
     TextFormat, Vector2,
 };
 
-use windows_rs_telemetry::history::History;
-use windows_rs_telemetry::network::format_rate;
-use windows_rs_telemetry::sampling::{MAX_SAMPLE_GAP, is_stale};
+use windows_rs_telemetry::format::rate as format_rate;
+use windows_rs_telemetry::history::{HISTORY_SPAN, History, PENDING_LABEL, unless_stale};
+use windows_rs_telemetry::sampling::{INTERVAL, MAX_SAMPLE_GAP, is_stale};
+use windows_rs_telemetry::{battery, nvme};
+
+/// 一帧的呈现结果；设备丢失时调用方重建 Renderer。
+pub enum Frame {
+    Presented,
+    DeviceLost,
+}
 
 pub struct Renderer {
     // 交换链先于设备释放。
@@ -24,22 +31,36 @@ pub struct Fonts {
     small: TextFormat,
 }
 
+const MARGIN: f32 = 24.0;
 const PANEL_TOP: f32 = 306.0;
 const FOOTER_SPACE: f32 = 28.0;
 const MIN_PLOT_HEIGHT: f32 = 60.0;
 const NETWORK_PLOT_INSET: f32 = 84.0;
 const MIN_HEIGHT: f32 = PANEL_TOP + FOOTER_SPACE + 3.0 * (NETWORK_PLOT_INSET + MIN_PLOT_HEIGHT);
+/// 低于这个宽或高就改画文字摘要。
+const COMPACT_BELOW: f32 = 500.0;
+/// 时间轴刻度把 HISTORY_SPAN 等分成几段。
+const TIME_AXIS_STEPS: u32 = 4;
+
+/// 中等高度时整张布局按比例缩小；None 表示原尺寸或文字摘要。
+fn layout_scale(width: f32, height: f32) -> Option<f32> {
+    (width >= COMPACT_BELOW && (COMPACT_BELOW..MIN_HEIGHT).contains(&height))
+        .then(|| height / MIN_HEIGHT)
+}
 
 impl Fonts {
     pub fn new() -> Result<Self> {
-        Self::scaled(1.0)
+        Self::for_layout_scale(1.0)
     }
 
-    fn scaled(scale: f32) -> Result<Self> {
+    /// 字号先除以布局缩放抵消变换，再乘 scale.sqrt()：文字只缩小一部分，
+    /// 否则行距随布局变小而字号不变，文字会互相重叠。
+    fn for_layout_scale(scale: f32) -> Result<Self> {
+        let factor = scale.sqrt() / scale;
         Ok(Self {
-            title: TextFormat::new_bold("Microsoft YaHei UI", 22.0 / scale)?,
-            body: TextFormat::new("Microsoft YaHei UI", 14.0 / scale)?,
-            small: TextFormat::new("Microsoft YaHei UI", 11.0 / scale)?,
+            title: TextFormat::new_bold("Microsoft YaHei UI", 22.0 * factor)?,
+            body: TextFormat::new("Microsoft YaHei UI", 14.0 * factor)?,
+            small: TextFormat::new("Microsoft YaHei UI", 11.0 * factor)?,
         })
     }
 }
@@ -69,7 +90,7 @@ impl Renderer {
         dpi: u32,
         history: &History,
         now: Instant,
-    ) -> Result<bool> {
+    ) -> Result<Frame> {
         if self.chain.width() != width || self.chain.height() != height {
             self.chain.resize(width, height)?;
         }
@@ -79,17 +100,17 @@ impl Renderer {
         }
         let dip_width = width as f32 * 96.0 / dpi as f32;
         let dip_height = height as f32 * 96.0 / dpi as f32;
-        let scale = dip_height / MIN_HEIGHT;
-        if dip_width >= 500.0 && dip_height >= 500.0 && scale < 1.0 {
-            if self
-                .scaled_fonts
-                .as_ref()
-                .is_none_or(|(cached, _)| (cached - scale).abs() > 0.01)
+        match layout_scale(dip_width, dip_height) {
+            Some(scale)
+                if self
+                    .scaled_fonts
+                    .as_ref()
+                    .is_none_or(|(cached, _)| (cached - scale).abs() > 0.01) =>
             {
-                self.scaled_fonts = Some((scale, Fonts::scaled(scale)?));
+                self.scaled_fonts = Some((scale, Fonts::for_layout_scale(scale)?));
             }
-        } else {
-            self.scaled_fonts = None;
+            Some(_) => {}
+            None => self.scaled_fonts = None,
         }
         {
             let session = self.chain.begin_draw()?;
@@ -99,7 +120,11 @@ impl Renderer {
                 .map_or(&self.fonts, |(_, fonts)| fonts);
             draw(&session, fonts, dip_width, dip_height, history, now)?;
         } // Drop 调用 EndDraw；结束绘制后才能 Present。
-        self.chain.present() // false 是设备丢失，不是成功呈现。
+        Ok(if self.chain.present()? {
+            Frame::Presented
+        } else {
+            Frame::DeviceLost
+        })
     }
 }
 
@@ -116,11 +141,10 @@ pub fn draw(
     history: &History,
     now: Instant,
 ) -> Result<()> {
-    if width < 500.0 || height < 500.0 {
+    if width < COMPACT_BELOW || height < COMPACT_BELOW {
         return draw_compact(session, fonts, width, height, history, now);
     }
-    if height < MIN_HEIGHT {
-        let scale = height / MIN_HEIGHT;
+    if let Some(scale) = layout_scale(width, height) {
         let previous = session.transform();
         session.set_transform(&Matrix3x2 {
             m11: previous.m11 * scale,
@@ -155,77 +179,27 @@ fn draw_compact(
         &text,
     );
     let latest = history.points.back();
-    let sample_stale = latest.is_some_and(|point| is_stale(Some(point.at), now, MAX_SAMPLE_GAP));
+    let sample_stale = is_stale(history.last_sample_at(), now, MAX_SAMPLE_GAP);
     let network_stale =
         latest.is_some_and(|point| is_stale(Some(point.network_at), now, MAX_SAMPLE_GAP));
-    let network =
-        latest.and_then(|point| (!network_stale).then_some((point.download?, point.upload?)));
-    let network_label = if network_stale {
-        "数据已过期".into()
-    } else {
-        network.map_or_else(
-            || history.network_status.clone(),
-            |(down, up)| format!("↓ {}  ↑ {}", format_rate(down), format_rate(up)),
-        )
-    };
+    let network = latest.and_then(|point| Some((point.download?, point.upload?)));
+    let network_label = network.map_or_else(
+        || history.network_status.clone(),
+        |(down, up)| format!("↓ {}  ↑ {}", format_rate(down), format_rate(up)),
+    );
     let pdh_stale = is_stale(history.pdh_at, now, MAX_SAMPLE_GAP);
+    let nvme_stale = is_stale(history.nvme_at, now, nvme::STALE_AFTER);
+    let battery_stale = is_stale(history.battery_at, now, battery::STALE_AFTER);
     let lines = [
-        format!(
-            "CPU  {}",
-            if sample_stale {
-                "数据已过期"
-            } else {
-                &history.cpu_label
-            }
-        ),
-        format!(
-            "内存  {}",
-            if sample_stale {
-                "数据已过期"
-            } else {
-                &history.ram_label
-            }
-        ),
-        format!("WLAN  {network_label}"),
-        format!(
-            "磁盘  {}",
-            if pdh_stale {
-                "数据已过期"
-            } else {
-                &history.disk_label
-            }
-        ),
-        format!(
-            "GPU  {}",
-            if pdh_stale {
-                "数据已过期"
-            } else {
-                &history.gpu_label
-            }
-        ),
-        format!(
-            "NVMe  {}",
-            if is_stale(
-                history.nvme_at,
-                now,
-                windows_rs_telemetry::nvme::STALE_AFTER
-            ) {
-                "数据已过期"
-            } else {
-                &history.nvme_label
-            }
-        ),
+        format!("CPU  {}", unless_stale(&history.cpu_label(), sample_stale)),
+        format!("内存  {}", unless_stale(&history.ram_label(), sample_stale)),
+        format!("WLAN  {}", unless_stale(&network_label, network_stale)),
+        format!("磁盘  {}", unless_stale(&history.disk_label, pdh_stale)),
+        format!("GPU  {}", unless_stale(&history.gpu_label, pdh_stale)),
+        format!("NVMe  {}", unless_stale(&history.nvme_label, nvme_stale)),
         format!(
             "电池  {}",
-            if is_stale(
-                history.battery_at,
-                now,
-                windows_rs_telemetry::battery::STALE_AFTER
-            ) {
-                "数据已过期"
-            } else {
-                &history.battery_label
-            }
+            unless_stale(&history.battery_label, battery_stale)
         ),
     ];
     let row_height = ((height - 65.0) / lines.len() as f32).clamp(24.0, 40.0);
@@ -265,68 +239,49 @@ fn draw_full(
     let ram = session.create_solid_brush(ColorF::rgb(0.48, 0.86, 0.65))?;
     let download_brush = session.create_solid_brush(ColorF::rgb(0.70, 0.56, 1.0))?;
     let upload_brush = session.create_solid_brush(ColorF::rgb(1.0, 0.66, 0.30))?;
-    let heading = "系统监控";
-    session.draw_text(
-        heading,
-        &fonts.title,
-        &Rect::from_xywh(24.0, 18.0, width - 48.0, 34.0),
-        &text,
-    );
-    session.draw_text(
-        "曲线：最近 60 秒 / 每秒采样  ·  电池 3 秒  ·  NVMe 30 秒  ·  磁盘/GPU 约 1 秒",
-        &fonts.small,
-        &Rect::from_xywh(24.0, 54.0, width - 48.0, 20.0),
-        &muted,
-    );
+    let content_width = width - 2.0 * MARGIN;
+    // 占满内容宽度的一行文字。
+    let line = |label: &str, font: &TextFormat, top: f32, height: f32, brush: &Brush| {
+        session.draw_text(
+            label,
+            font,
+            &Rect::from_xywh(MARGIN, top, content_width, height),
+            brush,
+        );
+    };
+    line("系统监控", &fonts.title, 18.0, 34.0, &text);
+    line(&subtitle(), &fonts.small, 54.0, 20.0, &muted);
 
     // 电池慢速刷新，只显示快照，不在 60 秒曲线上伪造平滑变化。
-    let battery_stale = is_stale(
-        history.battery_at,
-        now,
-        windows_rs_telemetry::battery::STALE_AFTER,
-    );
-    let basic = if battery_stale {
-        "电池数据已过期，等待新样本"
+    let battery_stale = is_stale(history.battery_at, now, battery::STALE_AFTER);
+    let (basic, detail) = if battery_stale {
+        ("电池数据已过期，等待新样本", "")
     } else {
-        &history.battery_label
+        (
+            history.battery_label.as_str(),
+            history.battery_detail.as_str(),
+        )
     };
-    let detail = if battery_stale {
-        ""
-    } else {
-        &history.battery_detail
-    };
-    session.draw_text(
-        &format!("电池  {basic}"),
-        &fonts.body,
-        &Rect::from_xywh(24.0, 84.0, width - 48.0, 24.0),
-        &ram,
-    );
-    session.draw_text(
-        detail,
-        &fonts.body,
-        &Rect::from_xywh(24.0, 112.0, width - 48.0, 24.0),
-        &text,
-    );
-    session.draw_text(
+    line(&format!("电池  {basic}"), &fonts.body, 84.0, 24.0, &ram);
+    line(detail, &fonts.body, 112.0, 24.0, &text);
+    line(
         "功率：+ 充电 / − 放电  ·  电池侧功率  ·  续航为估算值",
         &fonts.small,
-        &Rect::from_xywh(24.0, 140.0, width - 48.0, 20.0),
+        140.0,
+        20.0,
         &muted,
     );
-    let nvme_stale = is_stale(
-        history.nvme_at,
-        now,
-        windows_rs_telemetry::nvme::STALE_AFTER,
-    );
+    let nvme_stale = is_stale(history.nvme_at, now, nvme::STALE_AFTER);
     let nvme_label = if nvme_stale {
         "数据已过期，等待新样本"
     } else {
         &history.nvme_label
     };
-    session.draw_text(
+    line(
         &format!("NVMe / {}  {nvme_label}", history.nvme_name),
         &fonts.body,
-        &Rect::from_xywh(24.0, 168.0, width - 48.0, 24.0),
+        168.0,
+        24.0,
         &text,
     );
     if !nvme_stale {
@@ -334,78 +289,69 @@ fn draw_full(
             .nvme_at
             .map(|at| format!("  ·  {} 秒前", now.saturating_duration_since(at).as_secs()))
             .unwrap_or_default();
-        session.draw_text(
+        line(
             &format!("{}{}", history.nvme_detail, age),
             &fonts.small,
-            &Rect::from_xywh(24.0, 192.0, width - 48.0, 20.0),
+            192.0,
+            20.0,
             &muted,
         );
     }
     let pdh_stale = is_stale(history.pdh_at, now, MAX_SAMPLE_GAP);
-    let disk_label = if pdh_stale {
-        "数据已过期"
-    } else {
-        &history.disk_label
-    };
-    let gpu_label = if pdh_stale {
-        "数据已过期"
-    } else {
-        &history.gpu_label
-    };
-    session.draw_text(
-        &format!("物理磁盘 / _Total  {disk_label}"),
+    line(
+        &format!(
+            "物理磁盘 / _Total  {}",
+            unless_stale(&history.disk_label, pdh_stale)
+        ),
         &fonts.body,
-        &Rect::from_xywh(24.0, 220.0, width - 48.0, 24.0),
+        220.0,
+        24.0,
         &text,
     );
-    session.draw_text(
-        &format!("GPU / 最忙单引擎实例  {gpu_label}"),
+    line(
+        &format!(
+            "GPU / 最忙单引擎实例  {}",
+            unless_stale(&history.gpu_label, pdh_stale)
+        ),
         &fonts.body,
-        &Rect::from_xywh(24.0, 248.0, width - 48.0, 24.0),
+        248.0,
+        24.0,
         &text,
     );
-    session.draw_text(
+    line(
         "磁盘：PhysicalDisk 总读写速率  ·  GPU：单个进程/引擎实例，不是整卡利用率",
         &fonts.small,
-        &Rect::from_xywh(24.0, 275.0, width - 48.0, 20.0),
+        275.0,
+        20.0,
         &muted,
     );
-    let panel_top = PANEL_TOP;
-    let panel_height = (height - panel_top - FOOTER_SPACE) / 3.0;
-    let stale = history
-        .points
-        .back()
-        .is_none_or(|p| is_stale(Some(p.at), now, MAX_SAMPLE_GAP));
+    let panel_height = (height - PANEL_TOP - FOOTER_SPACE) / 3.0;
+    let stale = is_stale(history.last_sample_at(), now, MAX_SAMPLE_GAP);
     for (index, name, label, color, series) in [
         (
             0,
             "CPU",
-            &history.cpu_label,
+            history.cpu_label(),
             &cpu,
             history.series(now, |p| p.cpu),
         ),
         (
             1,
             "RAM",
-            &history.ram_label,
+            history.ram_label(),
             &ram,
             history.series(now, |p| p.ram),
         ),
     ] {
-        let top = panel_top + index as f32 * panel_height;
-        let label = if stale && !history.points.is_empty() {
+        let top = PANEL_TOP + index as f32 * panel_height;
+        let label = if history.points.is_empty() {
+            PENDING_LABEL
+        } else if stale {
             "数据已过期，等待新样本"
-        } else if history.points.is_empty() {
-            "等待采样"
         } else {
-            label.as_str()
+            &label
         };
-        session.draw_text(
-            &format!("{name}   {label}"),
-            &fonts.body,
-            &Rect::from_xywh(24.0, top, width - 48.0, 26.0),
-            color,
-        );
+        line(&format!("{name}   {label}"), &fonts.body, top, 26.0, color);
         let plot = Rect::new(110.0, top + 32.0, width - 28.0, top + panel_height - 32.0);
         draw_axes(
             session,
@@ -421,23 +367,22 @@ fn draw_full(
     let download = history.network_series(now, |p| p.download);
     let upload = history.network_series(now, |p| p.upload);
     let maximum = rate_ceiling(&download, &upload);
-    let top = panel_top + 2.0 * panel_height;
-    let stale_network = history
-        .points
-        .back()
-        .is_none_or(|p| is_stale(Some(p.network_at), now, MAX_SAMPLE_GAP));
-    let status = if stale_network && !history.points.is_empty() {
-        "数据已过期"
-    } else {
-        &history.network_status
-    };
-    session.draw_text(
-        &format!("网络 / {}  {status}", history.network_name),
+    let top = PANEL_TOP + 2.0 * panel_height;
+    let latest = history.points.back();
+    let stale_network = latest.is_some_and(|p| is_stale(Some(p.network_at), now, MAX_SAMPLE_GAP));
+    line(
+        &format!(
+            "网络 / {}  {}",
+            history.network_name,
+            unless_stale(&history.network_status, stale_network)
+        ),
         &fonts.body,
-        &Rect::from_xywh(24.0, top, width - 48.0, 24.0),
+        top,
+        24.0,
         &text,
     );
-    let latest = history.points.back().filter(|_| !stale_network);
+    let latest = latest.filter(|_| !stale_network);
+    let half_width = content_width / 2.0;
     for (index, name, value, brush) in [
         (0, "下载", latest.and_then(|p| p.download), &download_brush),
         (1, "上传", latest.and_then(|p| p.upload), &upload_brush),
@@ -447,9 +392,9 @@ fn draw_full(
             &format!("{name}  {label}"),
             &fonts.small,
             &Rect::from_xywh(
-                24.0 + index as f32 * (width - 48.0) / 2.0,
+                MARGIN + index as f32 * half_width,
                 top + 25.0,
-                (width - 48.0) / 2.0,
+                half_width,
                 20.0,
             ),
             brush,
@@ -469,13 +414,26 @@ fn draw_full(
     );
     draw_series(session, &download, plot, &download_brush, maximum);
     draw_series(session, &upload, plot, &upload_brush, maximum);
-    session.draw_text(
+    line(
         "RAM：物理内存占比  ·  网络：仅选中接口，纵轴随历史峰值调整",
         &fonts.small,
-        &Rect::from_xywh(24.0, height - 24.0, width - 48.0, 20.0),
+        height - 24.0,
+        20.0,
         &muted,
     );
     Ok(())
+}
+
+/// 各数据源的刷新周期都来自对应常量，改间隔时文案不会过时。
+fn subtitle() -> String {
+    format!(
+        "曲线：最近 {} 秒 / 每 {} 秒采样  ·  电池 {} 秒  ·  NVMe {} 秒  ·  磁盘/GPU 约 {} 秒",
+        HISTORY_SPAN.as_secs_f64(),
+        INTERVAL.as_secs_f64(),
+        battery::INTERVAL.as_secs_f64(),
+        nvme::INTERVAL.as_secs_f64(),
+        INTERVAL.as_secs_f64(),
+    )
 }
 
 fn draw_axes(
@@ -492,17 +450,18 @@ fn draw_axes(
         session.draw_text(
             label,
             &fonts.small,
-            &Rect::from_xywh(24.0, y - 8.0, 84.0, 18.0),
+            &Rect::from_xywh(MARGIN, y - 8.0, 84.0, 18.0),
             muted,
         );
     }
-    for seconds in [60, 45, 30, 15, 0] {
-        let x = plot.right - plot.width() * seconds as f32 / 60.0;
+    for step in (0..=TIME_AXIS_STEPS).rev() {
+        let fraction = step as f32 / TIME_AXIS_STEPS as f32;
+        let x = plot.right - plot.width() * fraction;
         session.draw_line(point(x, plot.top), point(x, plot.bottom), grid, 1.0);
-        let label = if seconds == 0 {
+        let label = if step == 0 {
             "现在".into()
         } else {
-            format!("-{seconds}s")
+            format!("-{:.0}s", HISTORY_SPAN.as_secs_f32() * fraction)
         };
         session.draw_text(
             &label,
@@ -513,7 +472,7 @@ fn draw_axes(
     }
 }
 
-/// 最低 1 KiB/s，以 2 的幂取整；上下行使用同一个最近 60 秒的峰值。
+/// 最低 1 KiB/s，以 2 的幂取整；上下行共用 HISTORY_SPAN 内的同一个峰值。
 fn rate_ceiling(download: &[Option<(f32, f32)>], upload: &[Option<(f32, f32)>]) -> f32 {
     let peak = download
         .iter()
@@ -556,6 +515,23 @@ mod tests {
     use windows_rs_telemetry::{
         cpu::CpuUsage, memory::MemorySnapshot, network::NetworkUsage, sampling::Sample,
     };
+
+    /// 32 位自顶向下 BMP，便于人工检查布局。
+    fn write_bmp(path: &std::path::Path, width: u32, height: u32, pixels: &[u8]) {
+        let mut bmp = Vec::new();
+        bmp.extend(b"BM");
+        bmp.extend((54 + pixels.len() as u32).to_le_bytes());
+        bmp.extend([0_u8; 4]);
+        bmp.extend(54_u32.to_le_bytes());
+        bmp.extend(40_u32.to_le_bytes());
+        bmp.extend((width as i32).to_le_bytes());
+        bmp.extend((-(height as i32)).to_le_bytes());
+        bmp.extend(1_u16.to_le_bytes());
+        bmp.extend(32_u16.to_le_bytes());
+        bmp.extend([0_u8; 24]);
+        bmp.extend(pixels);
+        std::fs::write(path, bmp).unwrap();
+    }
 
     fn render_history(now: Instant) -> History {
         let mut history = History::default();
@@ -603,16 +579,15 @@ mod tests {
         for (width, height, scale) in [
             (900, 800, 1.0_f32),
             (900, 640, 1.0),
+            (900, 500, 1.0),
             (450, 400, 1.0),
             (320, 240, 1.0),
             (1800, 1280, 2.0),
             (1800, 1600, 2.0),
         ] {
-            let dip_height = height as f32 / scale;
-            let fonts = if (500.0..MIN_HEIGHT).contains(&dip_height) {
-                Fonts::scaled(dip_height / MIN_HEIGHT)?
-            } else {
-                Fonts::new()?
+            let fonts = match layout_scale(width as f32 / scale, height as f32 / scale) {
+                Some(layout) => Fonts::for_layout_scale(layout)?,
+                None => Fonts::new()?,
             };
             let target = device.create_render_target(width, height)?;
             target.draw(|session| {
@@ -675,19 +650,7 @@ mod tests {
             if let Some(dir) = std::env::var_os("TELEMETRY_PREVIEW_DIR") {
                 let path =
                     std::path::PathBuf::from(dir).join(format!("canvas-{width}x{height}.bmp"));
-                let mut bmp = Vec::new();
-                bmp.extend(b"BM");
-                bmp.extend((54 + pixels.len() as u32).to_le_bytes());
-                bmp.extend([0_u8; 4]);
-                bmp.extend(54_u32.to_le_bytes());
-                bmp.extend(40_u32.to_le_bytes());
-                bmp.extend((width as i32).to_le_bytes());
-                bmp.extend((-(height as i32)).to_le_bytes());
-                bmp.extend(1_u16.to_le_bytes());
-                bmp.extend(32_u16.to_le_bytes());
-                bmp.extend([0_u8; 24]);
-                bmp.extend(pixels);
-                std::fs::write(path, bmp).unwrap();
+                write_bmp(&path, width, height, &pixels);
             }
         }
         Ok(())

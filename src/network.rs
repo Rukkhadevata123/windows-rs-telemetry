@@ -1,7 +1,11 @@
 //! 复制网络接口快照后，立即释放 Windows 分配的表。
 use std::{io, ptr, time::Instant};
 
-use crate::bindings::*;
+use crate::bindings::{
+    FreeMibTable, GetIfTable2, IF_OPER_STATUS, IF_TYPE_IEEE80211, IfOperStatusDormant,
+    IfOperStatusDown, IfOperStatusLowerLayerDown, IfOperStatusNotPresent, IfOperStatusTesting,
+    IfOperStatusUnknown, IfOperStatusUp, MIB_IF_ROW2, MIB_IF_TABLE2,
+};
 use crate::sampling::MAX_SAMPLE_GAP;
 
 #[derive(Debug)]
@@ -13,8 +17,7 @@ pub struct InterfaceSnapshot {
     pub description: String,
     pub is_hardware: bool,
     pub is_wifi: bool,
-    pub is_up: bool,
-    pub status: &'static str,
+    pub oper_status: IF_OPER_STATUS,
     pub received_bytes: u64,
     pub sent_bytes: u64,
 }
@@ -29,7 +32,6 @@ impl Drop for InterfaceTable {
     }
 }
 
-#[expect(non_upper_case_globals, reason = "模式匹配使用 Win32 原名的状态常量")]
 pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
     let mut raw = ptr::null_mut();
     // SAFETY：传入有效输出指针；Windows 分配表并把地址写入 raw。
@@ -51,7 +53,6 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
             let flags = ptr::addr_of!((*row).InterfaceAndOperStatusFlags)
                 .cast::<u8>()
                 .read();
-            let state = (*row).OperStatus;
             interfaces.push(InterfaceSnapshot {
                 luid: (*row).InterfaceLuid.Value,
                 index: (*row).InterfaceIndex,
@@ -59,17 +60,7 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
                 description: utf16(&(*row).Description),
                 is_hardware: flags & 1 != 0, // HardwareInterface 是最低位。
                 is_wifi: (*row).Type == IF_TYPE_IEEE80211 as u32,
-                is_up: state == IfOperStatusUp,
-                status: match state {
-                    IfOperStatusUp => "Up（可传输）",
-                    IfOperStatusDown => "Down（不可传输）",
-                    IfOperStatusTesting => "Testing（测试中）",
-                    IfOperStatusUnknown => "Unknown（未知）",
-                    IfOperStatusDormant => "Dormant（等待连接）",
-                    IfOperStatusNotPresent => "NotPresent（设备不在场）",
-                    IfOperStatusLowerLayerDown => "LowerLayerDown（下层断开）",
-                    _ => "未知状态",
-                },
+                oper_status: (*row).OperStatus,
                 received_bytes: (*row).InOctets,
                 sent_bytes: (*row).OutOctets,
             });
@@ -77,6 +68,20 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
     }
     // 返回的 Vec/String/u64 都属于 Rust；table 在此离开作用域，释放系统表。
     Ok(interfaces)
+}
+
+#[expect(non_upper_case_globals, reason = "模式匹配使用 Win32 原名的状态常量")]
+fn status_label(state: IF_OPER_STATUS) -> &'static str {
+    match state {
+        IfOperStatusUp => "Up（可传输）",
+        IfOperStatusDown => "Down（不可传输）",
+        IfOperStatusTesting => "Testing（测试中）",
+        IfOperStatusUnknown => "Unknown（未知）",
+        IfOperStatusDormant => "Dormant（等待连接）",
+        IfOperStatusNotPresent => "NotPresent（设备不在场）",
+        IfOperStatusLowerLayerDown => "LowerLayerDown（下层断开）",
+        _ => "未知状态",
+    }
 }
 
 fn utf16(value: &[u16]) -> String {
@@ -93,7 +98,7 @@ pub fn print_interfaces() -> io::Result<()> {
             "  LUID={:#018x}  index={}  {}  硬件={}  WLAN={}",
             interface.luid,
             interface.index,
-            interface.status,
+            status_label(interface.oper_status),
             interface.is_hardware,
             interface.is_wifi
         );
@@ -155,16 +160,7 @@ pub enum NetworkUsage {
     },
 }
 
-pub fn format_rate(bytes_per_sec: f64) -> String {
-    if bytes_per_sec >= 1024.0 * 1024.0 {
-        format!("{:.2} MiB/s", bytes_per_sec / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} KiB/s", bytes_per_sec / 1024.0)
-    }
-}
-
 struct Counters {
-    luid: u64,
     at: Instant,
     received: u64,
     sent: u64,
@@ -186,12 +182,11 @@ impl NetworkSampler {
             self.reset();
             return NetworkUsage::Unavailable;
         };
-        if !interface.is_up {
+        if interface.oper_status != IfOperStatusUp {
             self.reset();
             return NetworkUsage::Disconnected;
         }
         let now = Counters {
-            luid: interface.luid,
             at,
             received: interface.received_bytes,
             sent: interface.sent_bytes,
@@ -200,7 +195,7 @@ impl NetworkSampler {
             return NetworkUsage::Pending;
         };
         let elapsed = at.saturating_duration_since(prev.at);
-        if prev.luid != interface.luid || elapsed.is_zero() || elapsed > MAX_SAMPLE_GAP {
+        if elapsed.is_zero() || elapsed > MAX_SAMPLE_GAP {
             return NetworkUsage::Pending;
         }
         let (Some(received), Some(sent)) = (
@@ -229,8 +224,7 @@ mod tests {
             description: name.into(),
             is_hardware: hardware,
             is_wifi: true,
-            is_up: true,
-            status: "Up",
+            oper_status: IfOperStatusUp,
             received_bytes: 0,
             sent_bytes: 0,
         }
@@ -266,8 +260,7 @@ mod tests {
             description: "test".into(),
             is_hardware: true,
             is_wifi: true,
-            is_up: true,
-            status: "Up",
+            oper_status: IfOperStatusUp,
             received_bytes: 100,
             sent_bytes: 200,
         };
@@ -282,15 +275,41 @@ mod tests {
                 upload_bytes_per_sec: 1024.0
             }
         );
-        interface.is_up = false;
+        interface.oper_status = IfOperStatusDown;
         assert_eq!(
             sampler.update(Some(&interface), at + Duration::from_secs(2)),
             NetworkUsage::Disconnected
         );
-        interface.is_up = true;
+        interface.oper_status = IfOperStatusUp;
         assert_eq!(
             sampler.update(Some(&interface), at + Duration::from_secs(3)),
             NetworkUsage::Pending
+        );
+    }
+
+    #[test]
+    fn counter_reset_rewarms_instead_of_wrapping() {
+        let at = Instant::now();
+        let mut interface = interface("WLAN", 1, true);
+        interface.received_bytes = 10_000;
+        interface.sent_bytes = 10_000;
+        let mut sampler = NetworkSampler::default();
+        sampler.update(Some(&interface), at);
+        // 驱动重置后计数从零开始，不能算成接近 u64::MAX 的速率。
+        interface.received_bytes = 100;
+        let second = at + Duration::from_secs(1);
+        assert_eq!(
+            sampler.update(Some(&interface), second),
+            NetworkUsage::Pending
+        );
+        interface.received_bytes += 2048;
+        interface.sent_bytes += 1024;
+        assert_eq!(
+            sampler.update(Some(&interface), second + Duration::from_secs(1)),
+            NetworkUsage::Transfer {
+                download_bytes_per_sec: 2048.0,
+                upload_bytes_per_sec: 1024.0
+            }
         );
     }
 }

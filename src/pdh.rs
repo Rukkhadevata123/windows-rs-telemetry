@@ -1,31 +1,11 @@
 //! PDH CPU 频率估算、磁盘速率与 GPU Engine 实例。查询对象只在创建它的线程中使用。
 use std::{
-    mem::size_of,
     ptr,
     time::{Duration, Instant},
 };
 
-#[allow(
-    dead_code,
-    non_snake_case,
-    non_camel_case_types,
-    non_upper_case_globals,
-    clippy::upper_case_acronyms
-)]
-mod native {
-    include!(concat!(env!("OUT_DIR"), "/pdh.rs"));
-}
-
-#[allow(
-    dead_code,
-    non_snake_case,
-    non_camel_case_types,
-    non_upper_case_globals,
-    clippy::upper_case_acronyms
-)]
-mod dxgi {
-    include!(concat!(env!("OUT_DIR"), "/dxgi.rs"));
-}
+use crate::bindings::{dxgi, pdh as native};
+use crate::sampling::MAX_SAMPLE_GAP;
 
 const READ_TOTAL: &str = r"\PhysicalDisk(_Total)\Disk Read Bytes/sec";
 const WRITE_TOTAL: &str = r"\PhysicalDisk(_Total)\Disk Write Bytes/sec";
@@ -40,6 +20,8 @@ const PDH_CSTATUS_VALID_DATA: u32 = 0;
 const PDH_CSTATUS_NEW_DATA: u32 = 1;
 const DXGI_ERROR_NOT_FOUND: u32 = 0x887A_0002;
 const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
+/// EnumAdapters1 正常以 NOT_FOUND 结束；这个上限只防止驱动异常时无限枚举。
+const MAX_ADAPTERS: u32 = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DiskRates {
@@ -128,14 +110,52 @@ fn formatted_value(counter: native::PDH_HCOUNTER) -> Result<f64, String> {
     }
 }
 
+/// 速率类计数器需要两次 collect；距基线太近或间隔过长时都不读取。
+struct Baseline {
+    started: Instant,
+    last_poll: Instant,
+}
+
+enum Readiness {
+    /// 间隔过长，调用方应 collect 一次作为新基线。
+    Rebase,
+    Warming,
+    Ready,
+}
+
+impl Baseline {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_poll: now,
+        }
+    }
+
+    fn check(&mut self, now: Instant) -> Readiness {
+        if now.saturating_duration_since(self.last_poll) > MAX_SAMPLE_GAP {
+            // 睡眠恢复或慢采样后只重建基线，不展示跨长间隔的平均值。
+            *self = Self {
+                started: now,
+                last_poll: now,
+            };
+            Readiness::Rebase
+        } else if now.saturating_duration_since(self.started) < MIN_BASELINE_AGE {
+            Readiness::Warming
+        } else {
+            self.last_poll = now;
+            Readiness::Ready
+        }
+    }
+}
+
 /// 用 Windows 报告的基准 MHz 和动态性能百分比估算整机 CPU 频率。
 /// _Total 是聚合值，不能解释为某个核心的瞬时物理时钟。
 pub struct CpuFrequencySampler {
     query: Query,
     base: native::PDH_HCOUNTER,
     performance: native::PDH_HCOUNTER,
-    started: Instant,
-    last_poll: Instant,
+    baseline: Baseline,
 }
 
 impl CpuFrequencySampler {
@@ -144,30 +164,22 @@ impl CpuFrequencySampler {
         let base = add_counter(&query, CPU_BASE_MHZ)?;
         let performance = add_counter(&query, CPU_PERFORMANCE)?;
         collect(&query)?;
-        let started = Instant::now();
         Ok(Self {
             query,
             base,
             performance,
-            started,
-            last_poll: started,
+            baseline: Baseline::new(),
         })
     }
 
-    /// 首轮和长时间暂停后先重建基线；结果以 MHz 为单位。
+    /// 结果以 MHz 为单位；基线未就绪时返回 None。
     pub fn poll(&mut self) -> Result<Option<f64>, String> {
-        let now = Instant::now();
-        if now.saturating_duration_since(self.last_poll) > crate::sampling::MAX_SAMPLE_GAP {
-            collect(&self.query)?;
-            self.last_poll = now;
-            self.started = now;
-            return Ok(None);
-        }
-        if now.saturating_duration_since(self.started) < MIN_BASELINE_AGE {
-            return Ok(None);
+        match self.baseline.check(Instant::now()) {
+            Readiness::Rebase => return collect(&self.query).map(|()| None),
+            Readiness::Warming => return Ok(None),
+            Readiness::Ready => {}
         }
         collect(&self.query)?;
-        self.last_poll = now;
         let base_mhz = formatted_value(self.base)?;
         let performance_percent = formatted_value(self.performance)?;
         if base_mhz <= 0.0 || performance_percent <= 0.0 {
@@ -217,7 +229,7 @@ fn adapters() -> Result<Vec<Adapter>, String> {
     let factory: dxgi::IDXGIFactory1 =
         unsafe { dxgi::CreateDXGIFactory1() }.map_err(|e| format!("CreateDXGIFactory1: {e:?}"))?;
     let mut result = Vec::new();
-    for index in 0..32 {
+    for index in 0..MAX_ADAPTERS {
         // SAFETY: 工厂仍有效；仅在本线程枚举。
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
             Ok(adapter) => adapter,
@@ -422,8 +434,7 @@ impl GpuQuery {
 }
 
 pub struct Sampler {
-    started: Instant,
-    last_poll: Instant,
+    baseline: Baseline,
     disk: Result<DiskQuery, String>,
     gpu: Result<GpuQuery, String>,
     disk_retry_at: Instant,
@@ -440,35 +451,34 @@ impl Sampler {
     pub fn new() -> Self {
         let disk = DiskQuery::new();
         let gpu = GpuQuery::new();
-        let started = Instant::now();
+        let baseline = Baseline::new();
+        let retry_at = baseline.started + RETRY_INTERVAL;
         Self {
-            started,
-            last_poll: started,
+            baseline,
             disk,
             gpu,
-            disk_retry_at: started + RETRY_INTERVAL,
-            gpu_retry_at: started + RETRY_INTERVAL,
+            disk_retry_at: retry_at,
+            gpu_retry_at: retry_at,
         }
     }
 
-    /// 首次调用时速率还在预热；后续两项分别报告成功或失败。
+    /// 基线未就绪时返回 None；之后两项分别报告成功或失败。
     pub fn poll(&mut self) -> Option<Snapshot> {
         let now = Instant::now();
-        if now.saturating_duration_since(self.last_poll) > crate::sampling::MAX_SAMPLE_GAP {
-            // 睡眠恢复或慢采样后只重建基线，不展示跨长间隔平均速率。
-            if let Ok(disk) = &self.disk {
-                let _ = collect(&disk.query);
+        match self.baseline.check(now) {
+            Readiness::Rebase => {
+                // 这里只重建基线；查询本身的错误留给下一轮 poll 报告。
+                if let Ok(disk) = &self.disk {
+                    let _ = collect(&disk.query);
+                }
+                if let Ok(gpu) = &self.gpu {
+                    let _ = collect(&gpu.query);
+                }
+                return None;
             }
-            if let Ok(gpu) = &self.gpu {
-                let _ = collect(&gpu.query);
-            }
-            self.last_poll = now;
-            return None;
+            Readiness::Warming => return None,
+            Readiness::Ready => {}
         }
-        if now.saturating_duration_since(self.started) < MIN_BASELINE_AGE {
-            return None;
-        }
-        self.last_poll = now;
         let disk = self
             .disk
             .as_ref()

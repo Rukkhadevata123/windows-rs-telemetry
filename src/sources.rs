@@ -1,14 +1,31 @@
 //! 设备选择只在窗口启动时做一次；两个前端使用同一规则。
 use std::io;
 
-use crate::{config::Config, network, nvme};
+use crate::{
+    config::{self, Command, Config},
+    network, nvme,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Sources {
     pub network_luid: Option<u64>,
-    pub network_name: String,
+    pub network_name: Option<String>,
     pub disk: Option<nvme::DiskDevice>,
-    pub disk_name: String,
+}
+
+/// 处理帮助和列表命令；只有需要打开窗口时才返回配置。
+pub fn handle_command_line(binary: &str) -> io::Result<Option<Config>> {
+    match Command::parse(std::env::args().skip(1)).map_err(io::Error::other)? {
+        Command::Help => println!("{}", config::help(binary)),
+        Command::ListNetwork => network::print_interfaces()?,
+        Command::ListDisks => {
+            for disk in nvme::list_disks()? {
+                println!("{}  {}", disk.path, disk.name);
+            }
+        }
+        Command::Run(config) => return Ok(Some(config)),
+    }
+    Ok(None)
 }
 
 pub fn select(config: &Config) -> io::Result<Sources> {
@@ -29,12 +46,10 @@ pub fn select(config: &Config) -> io::Result<Sources> {
         }
         Err(error) => return Err(error),
     };
+    let (network_luid, network_name) = network.unzip();
     Ok(Sources {
-        network_luid: network.as_ref().map(|(luid, _)| *luid),
-        network_name: network.map_or_else(|| "未选择 WLAN".into(), |(_, name)| name),
-        disk_name: disk
-            .as_ref()
-            .map_or_else(|| "未选择 NVMe".into(), |disk| disk.name.clone()),
+        network_luid,
+        network_name,
         disk,
     })
 }

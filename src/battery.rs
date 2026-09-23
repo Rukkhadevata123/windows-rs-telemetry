@@ -1,10 +1,14 @@
 //! 普通权限的电池快照。功率直接由系统报告，不对容量做差分。
-use std::{mem::size_of, ptr::null, time::Duration};
+use std::{ptr::null, time::Duration};
 
 use crate::bindings as n;
 
 pub const INTERVAL: Duration = Duration::from_secs(3);
 pub const STALE_AFTER: Duration = Duration::from_secs(7);
+// SYSTEM_POWER_STATUS.BatteryFlag 的取值，见 WinBase.h。
+const BATTERY_FLAG_CHARGING: u8 = 8;
+const BATTERY_FLAG_NO_BATTERY: u8 = 128;
+const BATTERY_FLAG_UNKNOWN: u8 = 255;
 
 // Windows BOOLEAN 是字节；生成的 bool 字段不能直接承接系统写入的任意字节。
 #[repr(C)]
@@ -67,13 +71,14 @@ fn flag(value: u8) -> Option<bool> {
 }
 
 fn decode_power(raw: n::SYSTEM_POWER_STATUS) -> PowerStatus {
-    // 必须先处理 255（未知），再判断位；否则会把未知当成“无电池/充电”。
-    let present = (raw.BatteryFlag != 255).then_some(raw.BatteryFlag & 128 == 0);
+    // 必须先处理 UNKNOWN（255），再判断位；否则会把未知当成“无电池/充电”。
+    let present = (raw.BatteryFlag != BATTERY_FLAG_UNKNOWN)
+        .then_some(raw.BatteryFlag & BATTERY_FLAG_NO_BATTERY == 0);
     let ac_online = flag(raw.ACLineStatus);
     PowerStatus {
         ac_online,
         present,
-        charging: (present == Some(true)).then_some(raw.BatteryFlag & 8 != 0),
+        charging: (present == Some(true)).then_some(raw.BatteryFlag & BATTERY_FLAG_CHARGING != 0),
         percent: (present != Some(false) && raw.BatteryLifePercent <= 100)
             .then_some(raw.BatteryLifePercent),
         saver: flag(raw.SystemStatusFlag),
@@ -266,5 +271,62 @@ mod tests {
         let flow = decode_flow(raw);
         assert!(flow.present && flow.discharging);
         assert_eq!(flow.milliwatts, Some(-12000));
+    }
+
+    fn snapshot(power: n::SYSTEM_POWER_STATUS, flow: BatteryStateRaw) -> BatterySnapshot {
+        BatterySnapshot {
+            power: Ok(decode_power(power)),
+            flow: Ok(decode_flow(flow)),
+        }
+    }
+
+    #[test]
+    fn labels_distinguish_plugged_in_no_battery_and_unknown() {
+        let idle = BatteryStateRaw {
+            battery_present: 1,
+            ..Default::default()
+        };
+        let (basic, detail) = snapshot(
+            n::SYSTEM_POWER_STATUS {
+                ACLineStatus: 1,
+                BatteryFlag: 1,
+                BatteryLifePercent: 100,
+                BatteryLifeTime: u32::MAX,
+                ..Default::default()
+            },
+            idle,
+        )
+        .labels();
+        assert_eq!(basic, "100%  ·  外接电源  ·  未充电  ·  省电关闭");
+        assert!(detail.contains("未充放电") && detail.contains("剩余续航 —"));
+
+        let (basic, detail) = snapshot(
+            n::SYSTEM_POWER_STATUS {
+                ACLineStatus: 1,
+                BatteryFlag: BATTERY_FLAG_NO_BATTERY,
+                BatteryLifePercent: 255,
+                ..Default::default()
+            },
+            BatteryStateRaw::default(),
+        )
+        .labels();
+        assert!(basic.starts_with("无系统电池") && basic.contains("充电状态未知"));
+        assert!(detail.contains("无系统电池"));
+
+        let (basic, _) = snapshot(
+            n::SYSTEM_POWER_STATUS {
+                ACLineStatus: 255,
+                BatteryFlag: BATTERY_FLAG_UNKNOWN,
+                BatteryLifePercent: 255,
+                SystemStatusFlag: 255,
+                ..Default::default()
+            },
+            idle,
+        )
+        .labels();
+        assert_eq!(
+            basic,
+            "电量未知  ·  供电未知  ·  充电状态未知  ·  省电状态未知"
+        );
     }
 }

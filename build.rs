@@ -29,6 +29,10 @@ fn main() {
         "EndPaint",
         "GetClientRect",
         "GetDpiForWindow",
+        // 建窗前先声明 DPI 感知，初始尺寸和工作区才是物理像素。
+        "SetProcessDpiAwarenessContext",
+        "DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2",
+        "GetDpiForSystem",
         "SystemParametersInfoW",
         "SPI_GETWORKAREA",
         "IsIconic",
@@ -36,7 +40,6 @@ fn main() {
         "SWP_NOZORDER",
         "SWP_NOACTIVATE",
         "WM_PAINT",
-        "WM_SIZE",
         "WM_ERASEBKGND",
         // 枚举网络接口；系统分配的表必须交回 FreeMibTable。
         "GetIfTable2",
@@ -51,6 +54,12 @@ fn main() {
         "IfOperStatusLowerLayerDown",
         // NVMe：先读取设备描述符以识别总线和型号，再查询只读 SMART 日志。
         "CreateFileW",
+        "FILE_SHARE_READ",
+        "FILE_SHARE_WRITE",
+        "OPEN_EXISTING",
+        "INVALID_HANDLE_VALUE",
+        "ERROR_FILE_NOT_FOUND",
+        "ERROR_PATH_NOT_FOUND",
         "CloseHandle",
         "DeviceIoControl",
         "STORAGE_DEVICE_DESCRIPTOR",

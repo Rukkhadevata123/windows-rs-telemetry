@@ -11,17 +11,16 @@ use std::{
 
 use windows_reactor::*;
 use windows_rs_telemetry::{
-    battery,
-    config::{self, Command},
-    cpu::CpuUsage,
-    history::History,
-    network::{self, format_rate},
+    battery, format,
+    history::{History, PENDING_LABEL, STALE_LABEL, unless_stale},
     nvme,
     sampling::{INTERVAL, Latest, MAX_SAMPLE_GAP, Sample, SamplerThread, is_stale},
     sources::{self, Sources},
 };
 
 const CANCEL_CHECK: Duration = Duration::from_millis(100);
+/// 一次后台任务最多等一个采样周期；超时消息也会刷新样本年龄。
+const CHECKS_PER_TICK: u128 = INTERVAL.as_millis() / CANCEL_CHECK.as_millis();
 const BACKGROUND: Color = Color::rgb(10, 18, 32);
 const CARD: Color = Color::rgb(22, 36, 56);
 const HERO: Color = Color::rgb(19, 49, 70);
@@ -38,83 +37,6 @@ enum Message {
     Tick,
     SamplerStopped,
     DeliveryRejected,
-}
-
-enum Metric {
-    Pending,
-    Value(String),
-    Failed(String),
-}
-
-impl Metric {
-    fn label(&self, stale: bool) -> String {
-        if stale {
-            return "数据已过期".into();
-        }
-        match self {
-            Self::Pending => "预热中".into(),
-            Self::Value(value) => value.clone(),
-            Self::Failed(error) => format!("读取失败：{error}"),
-        }
-    }
-}
-
-struct Gauges {
-    cpu: Metric,
-    frequency: Metric,
-    memory: Metric,
-    cpu_percent: Option<f64>,
-    memory_percent: Option<f64>,
-    memory_detail: String,
-}
-
-impl Gauges {
-    fn from_sample(sample: &Sample) -> Self {
-        let (cpu, cpu_percent) = match &sample.cpu {
-            Ok(CpuUsage::Busy(ratio)) if ratio.is_finite() && (0.0..=1.0).contains(ratio) => (
-                Metric::Value(format!("{:.1}%", ratio * 100.0)),
-                Some(ratio * 100.0),
-            ),
-            Ok(CpuUsage::Pending) => (Metric::Pending, None),
-            Ok(_) => (Metric::Failed("无效利用率".into()), None),
-            Err(error) => (Metric::Failed(error.to_string()), None),
-        };
-        let frequency = match &sample.cpu_mhz {
-            Ok(Some(mhz)) if mhz.is_finite() && *mhz > 0.0 => {
-                Metric::Value(format!("{:.2} GHz", mhz / 1000.0))
-            }
-            Ok(Some(_)) => Metric::Failed("无效频率".into()),
-            Ok(None) => Metric::Pending,
-            Err(error) => Metric::Failed(error.clone()),
-        };
-        let (memory, memory_percent, memory_detail) = match &sample.memory {
-            Ok(snapshot)
-                if snapshot.total_bytes > 0 && snapshot.available_bytes <= snapshot.total_bytes =>
-            {
-                let gib = (1_u64 << 30) as f64;
-                let percent = snapshot.used_bytes() as f64 / snapshot.total_bytes as f64 * 100.0;
-                (
-                    Metric::Value(format!("{percent:.1}%")),
-                    Some(percent),
-                    format!(
-                        "已用 {:.2} / {:.2} GiB（Windows 可见）",
-                        snapshot.used_bytes() as f64 / gib,
-                        snapshot.total_bytes as f64 / gib,
-                    ),
-                )
-            }
-            Ok(_) => (Metric::Failed("容量无效".into()), None, String::new()),
-            Err(error) => (Metric::Failed(error.to_string()), None, String::new()),
-        };
-        Self {
-            cpu,
-            frequency,
-            memory,
-            cpu_percent,
-            memory_percent,
-            memory_detail,
-        }
-    }
 }
 
 fn start_sampler(
@@ -143,8 +65,7 @@ fn schedule_sample(
 ) {
     context.spawn_background_with_rejection(
         move |cancel| {
-            // 最多占用线程池工作线程一秒；超时消息也会刷新样本年龄。
-            for _ in 0..10 {
+            for _ in 0..CHECKS_PER_TICK {
                 if cancel.is_cancelled() {
                     return Message::SamplerStopped;
                 }
@@ -164,41 +85,47 @@ fn schedule_sample(
     );
 }
 
-fn fresh(label: &str, stale: bool) -> String {
-    if stale {
-        "数据已过期".into()
-    } else {
-        label.into()
-    }
+fn section_title(text: &'static str) -> TextBlock {
+    TextBlock::new()
+        .text(text)
+        .font_size(18.0)
+        .font_weight(FontWeight::SEMI_BOLD)
+        .foreground(TEXT)
 }
 
-fn info_card(title: &'static str, value: String, detail: String, accent: Color) -> View {
+fn card_frame(corner_radius: f64, padding: f64, content: View) -> View {
     Border::new()
         .background(CARD)
         .border_brush(STROKE)
         .border_thickness(1.0)
-        .corner_radius(16.0)
-        .padding(18.0)
-        .content(
-            StackPanel::new().spacing(8.0).children((
-                TextBlock::new()
-                    .text(title)
-                    .font_size(12.0)
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .foreground(accent),
-                TextBlock::new()
-                    .text(value)
-                    .font_size(18.0)
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .foreground(TEXT)
-                    .text_wrapping(TextWrapping::Wrap),
-                TextBlock::new()
-                    .text(detail)
-                    .font_size(12.0)
-                    .foreground(MUTED)
-                    .text_wrapping(TextWrapping::Wrap),
-            )),
-        )
+        .corner_radius(corner_radius)
+        .padding(padding)
+        .content(content)
+}
+
+fn info_card(title: &'static str, value: String, detail: String, accent: Color) -> View {
+    card_frame(
+        16.0,
+        18.0,
+        StackPanel::new().spacing(8.0).children((
+            TextBlock::new()
+                .text(title)
+                .font_size(12.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(accent),
+            TextBlock::new()
+                .text(value)
+                .font_size(18.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(TEXT)
+                .text_wrapping(TextWrapping::Wrap),
+            TextBlock::new()
+                .text(detail)
+                .font_size(12.0)
+                .foreground(MUTED)
+                .text_wrapping(TextWrapping::Wrap),
+        )),
+    )
 }
 
 fn gauge_card(
@@ -215,33 +142,29 @@ fn gauge_card(
             .value(value.clamp(0.0, 100.0))
             .into()
     });
-    Border::new()
-        .background(CARD)
-        .border_brush(STROKE)
-        .border_thickness(1.0)
-        .corner_radius(18.0)
-        .padding(20.0)
-        .content(
-            StackPanel::new().spacing(10.0).children((
-                TextBlock::new()
-                    .text(title)
-                    .font_size(13.0)
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .foreground(accent),
-                TextBlock::new()
-                    .text(value)
-                    .font_size(34.0)
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .foreground(TEXT)
-                    .text_wrapping(TextWrapping::Wrap),
-                bar,
-                TextBlock::new()
-                    .text(detail)
-                    .font_size(12.0)
-                    .foreground(MUTED)
-                    .text_wrapping(TextWrapping::Wrap),
-            )),
-        )
+    card_frame(
+        18.0,
+        20.0,
+        StackPanel::new().spacing(10.0).children((
+            TextBlock::new()
+                .text(title)
+                .font_size(13.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(accent),
+            TextBlock::new()
+                .text(value)
+                .font_size(34.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(TEXT)
+                .text_wrapping(TextWrapping::Wrap),
+            bar,
+            TextBlock::new()
+                .text(detail)
+                .font_size(12.0)
+                .foreground(MUTED)
+                .text_wrapping(TextWrapping::Wrap),
+        )),
+    )
 }
 
 struct TelemetryPage {
@@ -249,8 +172,6 @@ struct TelemetryPage {
     receiver: Option<Arc<Mutex<Receiver<()>>>>,
     latest: Arc<Latest<Sample>>,
     history: History,
-    gauges: Option<Gauges>,
-    last_sample_at: Option<Instant>,
     error: Option<String>,
 }
 
@@ -259,22 +180,16 @@ impl Component for TelemetryPage {
     type Message = Message;
 
     fn create(input: &Sources, context: &ComponentContext<Self>) -> Self {
+        let history = History::for_sources(input);
         match start_sampler(input) {
             Ok((sampler, receiver, latest)) => {
                 let receiver = Arc::new(Mutex::new(receiver));
                 schedule_sample(context, Arc::clone(&receiver), Arc::clone(&latest));
-                let history = History {
-                    network_name: input.network_name.clone(),
-                    nvme_name: input.disk_name.clone(),
-                    ..History::default()
-                };
                 Self {
                     sampler: Some(sampler),
                     receiver: Some(receiver),
                     latest,
                     history,
-                    gauges: None,
-                    last_sample_at: None,
                     error: None,
                 }
             }
@@ -282,9 +197,7 @@ impl Component for TelemetryPage {
                 sampler: None,
                 receiver: None,
                 latest: Arc::new(Latest::default()),
-                history: History::default(),
-                gauges: None,
-                last_sample_at: None,
+                history,
                 error: Some(format!("采样线程启动失败：{error}")),
             },
         }
@@ -293,10 +206,7 @@ impl Component for TelemetryPage {
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         match message {
             Message::Sample(sample) => {
-                let gauges = Gauges::from_sample(&sample);
-                self.last_sample_at = Some(sample.taken_at);
                 self.history.push(*sample);
-                self.gauges = Some(gauges);
                 if let Some(receiver) = &self.receiver {
                     schedule_sample(context, Arc::clone(receiver), Arc::clone(&self.latest));
                 }
@@ -322,74 +232,77 @@ impl Component for TelemetryPage {
     fn view(&self, _input: &Sources, context: &mut ViewContext<Self>) -> View {
         context.window_title("Telemetry · WinUI");
         let now = Instant::now();
-        let age = self
-            .last_sample_at
-            .map(|at| now.saturating_duration_since(at));
+        let history = &self.history;
+        let last_sample_at = history.last_sample_at();
         let stopped = self.error.is_some();
-        let stale = stopped || is_stale(self.last_sample_at, now, MAX_SAMPLE_GAP);
+        let stale = stopped || is_stale(last_sample_at, now, MAX_SAMPLE_GAP);
         let status = if let Some(error) = &self.error {
             error.clone()
-        } else if let Some(age) = age {
+        } else if let Some(at) = last_sample_at {
+            let age = now.saturating_duration_since(at).as_secs_f64();
             if stale {
-                format!("数据已过期：上次采样在 {:.1} 秒前", age.as_secs_f64())
+                format!("{STALE_LABEL}：上次采样在 {age:.1} 秒前")
             } else {
-                format!("自动刷新中 · 上次采样在 {:.1} 秒前", age.as_secs_f64())
+                format!("自动刷新中 · 上次采样在 {age:.1} 秒前")
             }
         } else {
             "预热中 · 等待首份样本".into()
         };
-        let label = |metric: fn(&Gauges) -> &Metric| {
-            self.gauges
-                .as_ref()
-                .map_or_else(|| "预热中".into(), |gauges| metric(gauges).label(stale))
-        };
-        let cpu_percent = self
-            .gauges
-            .as_ref()
-            .and_then(|gauges| gauges.cpu_percent)
+        let fresh = |label: String| unless_stale(&label, stale).to_owned();
+        let cpu_value = fresh(history.cpu.label(|ratio| format::percent(*ratio)));
+        let memory_value = fresh(history.memory.label(|m| format::percent(m.ratio)));
+        let frequency_value = fresh(history.cpu_mhz.label(|mhz| format::ghz(*mhz)));
+        let cpu_percent = history
+            .cpu
+            .value()
+            .map(|ratio| ratio * 100.0)
             .filter(|_| !stale);
-        let memory_percent = self
-            .gauges
-            .as_ref()
-            .and_then(|gauges| gauges.memory_percent)
+        let memory_percent = history
+            .memory
+            .value()
+            .map(|m| m.ratio * 100.0)
             .filter(|_| !stale);
-        let memory_detail = if stale {
-            "等待最新内存快照".into()
-        } else {
-            self.gauges.as_ref().map_or_else(
-                || "Windows 可见物理内存".into(),
-                |gauges| gauges.memory_detail.clone(),
-            )
+        let memory_detail = match history.memory.value() {
+            _ if stale => "等待最新内存快照".into(),
+            Some(m) => format!(
+                "已用 {}（Windows 可见）",
+                format::gib_pair(m.used_bytes, m.total_bytes)
+            ),
+            None => "Windows 可见物理内存".into(),
         };
-        let network_at = self.history.points.back().map(|point| point.network_at);
-        let network_value = if stopped || is_stale(network_at, now, MAX_SAMPLE_GAP) {
-            "数据已过期".into()
-        } else if let Some(point) = self.history.points.back() {
-            match (point.download, point.upload) {
+        let network_point = history.points.back();
+        let network_stale = stopped
+            || is_stale(
+                network_point.map(|point| point.network_at),
+                now,
+                MAX_SAMPLE_GAP,
+            );
+        let network_value = match network_point {
+            _ if network_stale => STALE_LABEL.into(),
+            None => PENDING_LABEL.into(),
+            Some(point) => match (point.download, point.upload) {
                 (Some(down), Some(up)) => {
-                    format!("↓ {}    ↑ {}", format_rate(down), format_rate(up))
+                    format!("↓ {}    ↑ {}", format::rate(down), format::rate(up))
                 }
-                _ => self.history.network_status.clone(),
-            }
-        } else {
-            "等待采样".into()
+                _ => history.network_status.clone(),
+            },
         };
-        let battery_stale = stopped || is_stale(self.history.battery_at, now, battery::STALE_AFTER);
-        let nvme_stale = stopped || is_stale(self.history.nvme_at, now, nvme::STALE_AFTER);
-        let pdh_stale = stopped || is_stale(self.history.pdh_at, now, MAX_SAMPLE_GAP);
-        let battery_value = fresh(&self.history.battery_label, battery_stale);
-        let nvme_value = fresh(&self.history.nvme_label, nvme_stale);
-        let disk_value = fresh(&self.history.disk_label, pdh_stale);
-        let gpu_value = fresh(&self.history.gpu_label, pdh_stale);
+        let battery_stale = stopped || is_stale(history.battery_at, now, battery::STALE_AFTER);
+        let nvme_stale = stopped || is_stale(history.nvme_at, now, nvme::STALE_AFTER);
+        let pdh_stale = stopped || is_stale(history.pdh_at, now, MAX_SAMPLE_GAP);
+        let battery_value = unless_stale(&history.battery_label, battery_stale).to_owned();
+        let nvme_value = unless_stale(&history.nvme_label, nvme_stale).to_owned();
+        let disk_value = unless_stale(&history.disk_label, pdh_stale).to_owned();
+        let gpu_value = unless_stale(&history.gpu_label, pdh_stale).to_owned();
         let nvme_detail = if nvme_stale {
-            format!("{} · 等待新快照", self.history.nvme_name)
+            format!("{} · 等待新快照", history.nvme_name)
         } else {
-            format!("{} · {}", self.history.nvme_name, self.history.nvme_detail)
+            format!("{} · {}", history.nvme_name, history.nvme_detail)
         };
         let battery_detail = if battery_stale {
             "等待新快照".into()
         } else {
-            self.history.battery_detail.clone()
+            history.battery_detail.clone()
         };
 
         Border::new().background(BACKGROUND).content(
@@ -422,40 +335,32 @@ impl Component for TelemetryPage {
                                             .text_wrapping(TextWrapping::Wrap),
                                     )),
                                 ),
-                            TextBlock::new()
-                                .text("核心指标")
-                                .font_size(18.0)
-                                .font_weight(FontWeight::SEMI_BOLD)
-                                .foreground(TEXT),
+                            section_title("核心指标"),
                             gauge_card(
                                 "CPU / 总利用率",
-                                label(|gauges| &gauges.cpu),
+                                cpu_value,
                                 "全部逻辑处理器 · 最近一次采样区间".into(),
                                 cpu_percent,
                                 CYAN,
                             ),
                             gauge_card(
                                 "RAM / 物理内存",
-                                label(|gauges| &gauges.memory),
+                                memory_value,
                                 memory_detail,
                                 memory_percent,
                                 GREEN,
                             ),
                             info_card(
                                 "CPU / 估算频率",
-                                label(|gauges| &gauges.frequency),
+                                frequency_value,
                                 "PDH _Total 估算 · 非单核瞬时时钟".into(),
                                 VIOLET,
                             ),
-                            TextBlock::new()
-                                .text("设备活动")
-                                .font_size(18.0)
-                                .font_weight(FontWeight::SEMI_BOLD)
-                                .foreground(TEXT),
+                            section_title("设备活动"),
                             info_card(
                                 "WLAN / 吞吐",
                                 network_value,
-                                format!("选中接口：{} · 字节每秒", self.history.network_name),
+                                format!("选中接口：{} · 字节每秒", history.network_name),
                                 CYAN,
                             ),
                             info_card(
@@ -485,19 +390,9 @@ impl Component for TelemetryPage {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let command = Command::parse(std::env::args().skip(1)).map_err(io::Error::other)?;
-    match command {
-        Command::Help => println!("{}", config::help("telemetry-reactor")),
-        Command::ListNetwork => network::print_interfaces()?,
-        Command::ListDisks => {
-            for disk in nvme::list_disks()? {
-                println!("{}  {}", disk.path, disk.name);
-            }
-        }
-        Command::Run(config) => {
-            let selected = sources::select(&config)?;
-            App::run_component::<TelemetryPage>(selected)?;
-        }
+    if let Some(config) = sources::handle_command_line("telemetry-reactor")? {
+        let selected = sources::select(&config)?;
+        App::run_component::<TelemetryPage>(selected)?;
     }
     Ok(())
 }
