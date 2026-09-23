@@ -13,6 +13,14 @@ cargo run --locked --features reactor --bin telemetry-reactor
 
 已缓存全部依赖时可在命令中加 `--offline`。正式构建使用 `cargo build --release --locked`；若需要 WinUI 入口，使用 `cargo build --release --locked --features reactor`。默认构建不包含 Reactor。
 
+默认构建的两个图形 exe 使用 Windows 图形子系统，双击启动时不会弹出控制台窗口。需要在终端查看帮助、设备列表或诊断输出时，添加 `console` feature 构建并运行，例如：
+
+```powershell
+cargo run --locked --features console --bin windows-rs-telemetry -- --help
+cargo run --locked --features console --bin windows-rs-telemetry -- --list-disks
+cargo run --locked --features "reactor,console" --bin telemetry-reactor -- --help
+```
+
 两个入口接受相同的选项：
 
 ```text

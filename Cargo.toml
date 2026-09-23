@@ -6,6 +6,7 @@ rust-version = "1.88"
 default-run = "windows-rs-telemetry"
 
 [features]
+console = []
 reactor = ["dep:windows-reactor"]
 
 [dependencies]

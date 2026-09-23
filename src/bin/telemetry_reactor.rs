@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
+
 //! 使用 WinUI 控件展示遥测快照。
 use std::{
     error::Error,

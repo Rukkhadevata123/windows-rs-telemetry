@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
+
 mod chart;
 mod ui;
 
