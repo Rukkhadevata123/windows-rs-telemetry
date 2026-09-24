@@ -21,8 +21,8 @@ pub const WM_APP_SAMPLE: u32 = win::WM_APP as u32;
 const INITIAL_SIZE: (i32, i32) = (1400, 1480);
 const WORK_AREA_MARGIN: i32 = 32;
 
-/// 采样线程只能通过它向窗口投递 WM_APP_SAMPLE。HWND 是裸指针，不是 Send；
-/// 这里只保存句柄值，而 PostMessageW 允许跨线程调用。
+/// 采样线程通过 PostMessageW 向窗口投递 WM_APP_SAMPLE。
+/// HWND 裸指针类型不实现 Send；这里跨线程传递句柄值，投递时再转换为 HWND。
 pub struct UiWaker {
     hwnd: usize,
 }
@@ -41,7 +41,7 @@ impl UiWaker {
     }
 }
 
-/// UI 线程独占；历史保存在 CPU 内存里，重建 GPU 资源不会丢数据。
+/// UI 线程独占历史数据；重建 GPU 资源时保留历史数据。
 #[derive(Default)]
 pub struct View {
     pub history: History,
@@ -84,7 +84,7 @@ impl View {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let now = Instant::now();
         self.history.prune(now);
-        // 最多重建一次，不在设备反复丢失时无限循环。
+        // 设备丢失时最多重建一次。
         for attempt in 0..2 {
             let renderer = match &mut self.renderer {
                 Some(renderer) => renderer,

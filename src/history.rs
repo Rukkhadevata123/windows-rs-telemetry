@@ -1,4 +1,4 @@
-//! 保存时间戳、曲线数据、结构化最新读数和慢速指标的显示标签，不依赖窗口/Canvas。
+//! 保存时间戳、曲线数据、结构化最新读数和慢速指标的显示标签，供两个窗口入口使用。
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -17,7 +17,7 @@ const MAX_POINTS: usize = 256;
 pub const PENDING_LABEL: &str = "等待采样";
 pub const STALE_LABEL: &str = "数据已过期";
 
-/// 过期时统一替换成 STALE_LABEL，不再展示旧值。
+/// 过期读数统一显示 STALE_LABEL。
 pub fn unless_stale(label: &str, stale: bool) -> &str {
     if stale { STALE_LABEL } else { label }
 }

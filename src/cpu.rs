@@ -33,7 +33,7 @@ pub fn read_cpu_times() -> std::io::Result<CpuTimes> {
     })
 }
 
-/// 一次计算的结果。“还没有值”是独立状态，不用 0% 冒充。
+/// 一次计算的结果，区分等待基线和有效利用率。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CpuUsage {
     /// 第一次采样，或刚刚重建基线，要等下一次采样才有速率
@@ -65,12 +65,11 @@ impl CpuSampler {
 
         let elapsed = at.saturating_duration_since(prev_at);
         if elapsed.is_zero() || elapsed > MAX_SAMPLE_GAP {
-            // 暂停/恢复后的第一份读数只作基线，不把长区间平均值当成当前利用率。
+            // 暂停/恢复后的首份读数重建基线，下一份样本再计算利用率。
             return CpuUsage::Pending;
         }
 
-        // checked_sub：计数回退（理论上不该发生，但不信任外部数据）时得到 None，
-        // 这时丢弃这个区间、以当前值重建基线，而不是算出一个巨大的假值。
+        // checked_sub 在计数回退时返回 None；丢弃该区间，以当前值重建基线。
         let (Some(d_idle), Some(d_kernel), Some(d_user)) = (
             now.idle.checked_sub(prev.idle),
             now.kernel.checked_sub(prev.kernel),
@@ -79,7 +78,7 @@ impl CpuSampler {
             return CpuUsage::Pending;
         };
 
-        // 分母是 ΔKernel + ΔUser，不要再加 ΔIdle：它已经包含在 ΔKernel 里。
+        // 分母是 ΔKernel + ΔUser；Windows 的 ΔKernel 已包含 ΔIdle。
         let total = d_kernel + d_user;
         if total == 0 || d_idle > total {
             // 零增量（两次读得太近）或数据自相矛盾：这个区间没法解释

@@ -1,4 +1,4 @@
-//! 普通权限的电池快照。功率直接由系统报告，不对容量做差分。
+//! 普通权限的电池快照。电池侧功率取自系统报告值。
 use std::{ptr::null, time::Duration};
 
 use crate::bindings as n;
@@ -124,7 +124,7 @@ pub fn collect_battery() -> BatterySnapshot {
             size_of::<BatteryStateRaw>() as u32,
         )
     };
-    // 此 API 返回 NTSTATUS；不能用 GetLastError 解释它。
+    // CallNtPowerInformation 返回 NTSTATUS，按返回值直接报告错误。
     let flow = if status == 0 {
         Ok(decode_flow(flow))
     } else {

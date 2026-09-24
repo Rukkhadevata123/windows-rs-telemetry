@@ -41,9 +41,9 @@ pub struct Sample {
     /// 网络独立记录查询完成的时刻，差分和横轴使用同一个时间来源。
     pub network_at: Instant,
     pub network: io::Result<NetworkUsage>,
-    /// 慢速电池快照随每份样本携带，信箱合并时不会丢失；时间戳只在重读时更新。
+    /// 电池快照随每份样本携带，供 UI 忙碌后读取最新结果；时间戳仅在重读时更新。
     pub battery: Option<(Instant, Arc<BatterySnapshot>)>,
-    /// NVMe 低频快照也随每份样本携带，UI 忙碌合并通知时不会丢更新。
+    /// NVMe 快照随每份样本携带，供 UI 忙碌后读取最新结果。
     pub nvme: Option<(Instant, Arc<Result<SmartHealth, String>>)>,
     /// PDH 同一轮结果：磁盘与 GPU 各自可失败；首轮为 None，等待基线。
     pub pdh: Option<(Instant, pdh::Snapshot)>,

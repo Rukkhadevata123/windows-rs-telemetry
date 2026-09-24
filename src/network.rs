@@ -10,7 +10,7 @@ use crate::sampling::MAX_SAMPLE_GAP;
 
 #[derive(Debug)]
 pub struct InterfaceSnapshot {
-    /// 用于后续采样关联接口；不是枚举顺序，也不把可变的接口 index 当永久标识。
+    /// LUID 用于跨采样周期关联接口；接口 index 可能变化。
     pub luid: u64,
     pub index: u32,
     pub name: String,
@@ -22,7 +22,7 @@ pub struct InterfaceSnapshot {
     pub sent_bytes: u64,
 }
 
-/// 唯一拥有系统表的对象。不用 Box::from_raw：这块内存不是 Rust 分配的。
+/// 唯一拥有 Windows 分配的系统表，Drop 时用 FreeMibTable 释放。
 struct InterfaceTable(*mut MIB_IF_TABLE2);
 
 impl Drop for InterfaceTable {
@@ -37,13 +37,13 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
     // SAFETY：传入有效输出指针；Windows 分配表并把地址写入 raw。
     let status = unsafe { GetIfTable2(&mut raw) };
     if status != 0 {
-        // 这个 API 直接返回错误码，不能照搬 BOOL + GetLastError 的写法。
+        // GetIfTable2 直接返回错误码，用返回值构造 io::Error。
         return Err(io::Error::from_raw_os_error(status));
     }
     let table = InterfaceTable(raw);
     let mut interfaces = Vec::new();
     // SAFETY：成功返回的表包含 NumEntries 行；按生成结构体定位首行并跨过对齐填充。
-    // Table 的 [ROW; 1] 是 C 可变长尾数组的占位，不代表实际只有一行。
+    // Table 的 [ROW; 1] 是 C 可变长尾数组的占位；实际行数由 NumEntries 决定。
     unsafe {
         let first = ptr::addr_of!((*table.0).Table).cast::<MIB_IF_ROW2>();
         for index in 0..(*table.0).NumEntries as usize {
@@ -295,7 +295,7 @@ mod tests {
         interface.sent_bytes = 10_000;
         let mut sampler = NetworkSampler::default();
         sampler.update(Some(&interface), at);
-        // 驱动重置后计数从零开始，不能算成接近 u64::MAX 的速率。
+        // 驱动重置使计数回退时，重建差分基线。
         interface.received_bytes = 100;
         let second = at + Duration::from_secs(1);
         assert_eq!(

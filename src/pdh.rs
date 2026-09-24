@@ -150,7 +150,7 @@ impl Baseline {
 }
 
 /// 用 Windows 报告的基准 MHz 和动态性能百分比估算整机 CPU 频率。
-/// _Total 是聚合值，不能解释为某个核心的瞬时物理时钟。
+/// _Total 汇总所有逻辑处理器。
 pub struct CpuFrequencySampler {
     query: Query,
     base: native::PDH_HCOUNTER,
