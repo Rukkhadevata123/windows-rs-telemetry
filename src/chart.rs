@@ -516,23 +516,6 @@ mod tests {
         cpu::CpuUsage, memory::MemorySnapshot, network::NetworkUsage, sampling::Sample,
     };
 
-    /// 32 位自顶向下 BMP，便于人工检查布局。
-    fn write_bmp(path: &std::path::Path, width: u32, height: u32, pixels: &[u8]) {
-        let mut bmp = Vec::new();
-        bmp.extend(b"BM");
-        bmp.extend((54 + pixels.len() as u32).to_le_bytes());
-        bmp.extend([0_u8; 4]);
-        bmp.extend(54_u32.to_le_bytes());
-        bmp.extend(40_u32.to_le_bytes());
-        bmp.extend((width as i32).to_le_bytes());
-        bmp.extend((-(height as i32)).to_le_bytes());
-        bmp.extend(1_u16.to_le_bytes());
-        bmp.extend(32_u16.to_le_bytes());
-        bmp.extend([0_u8; 24]);
-        bmp.extend(pixels);
-        std::fs::write(path, bmp).unwrap();
-    }
-
     fn render_history(now: Instant) -> History {
         let mut history = History::default();
         for index in 0..=60 {
@@ -645,12 +628,6 @@ mod tests {
                     purple > 30 && orange > 30,
                     "network curves: purple={purple}, orange={orange}"
                 );
-            }
-            // 可选保存真实渲染的 BMP，便于人工检查布局，不影响普通测试。
-            if let Some(dir) = std::env::var_os("TELEMETRY_PREVIEW_DIR") {
-                let path =
-                    std::path::PathBuf::from(dir).join(format!("canvas-{width}x{height}.bmp"));
-                write_bmp(&path, width, height, &pixels);
             }
         }
         Ok(())

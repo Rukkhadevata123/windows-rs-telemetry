@@ -111,33 +111,13 @@ mod tests {
     }
 
     #[test]
-    fn first_sample_is_pending() {
-        assert_eq!(
-            CpuSampler::new().update(t(1, 2, 3), Instant::now()),
-            CpuUsage::Pending
-        );
-    }
-
-    #[test]
-    fn fully_idle() {
-        // 100 单位全是空闲：kernel 增加 100，其中 idle 也是 100
-        assert_eq!(usage_after(100, 100, 0), CpuUsage::Busy(0.0));
-    }
-
-    #[test]
-    fn fully_busy() {
-        assert_eq!(usage_after(0, 60, 40), CpuUsage::Busy(1.0));
-    }
-
-    #[test]
-    fn half_busy() {
-        // 总共 100：内核 80（其中空闲 50）+ 用户 20 → 忙 50
-        assert_eq!(usage_after(50, 80, 20), CpuUsage::Busy(0.5));
-    }
-
-    #[test]
-    fn zero_delta_is_pending() {
-        assert_eq!(usage_after(0, 0, 0), CpuUsage::Pending);
+    fn usage_subtracts_idle_from_kernel_and_user() {
+        // kernel 已包含 idle；三组增量分别表示全空闲、全忙和半忙。
+        for (idle, kernel, user, expected) in
+            [(100, 100, 0, 0.0), (0, 60, 40, 1.0), (50, 80, 20, 0.5)]
+        {
+            assert_eq!(usage_after(idle, kernel, user), CpuUsage::Busy(expected));
+        }
     }
 
     #[test]
@@ -161,7 +141,11 @@ mod tests {
     fn long_gap_and_read_failure_require_a_fresh_baseline() {
         let at = Instant::now();
         let mut s = CpuSampler::new();
-        s.update(t(0, 0, 0), at);
+        assert_eq!(s.update(t(0, 0, 0), at), CpuUsage::Pending);
+        assert_eq!(
+            s.update(t(0, 0, 0), at + Duration::from_secs(1)),
+            CpuUsage::Pending
+        );
         assert_eq!(
             s.update(t(100, 200, 100), at + Duration::from_secs(30)),
             CpuUsage::Pending

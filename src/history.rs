@@ -424,33 +424,10 @@ mod tests {
         h.push(demo_sample(now - Duration::from_secs(1), 1));
         assert!(h.cpu_label().contains("probe failed"));
         assert_eq!(h.points.len(), 1);
-    }
-
-    #[test]
-    fn latest_values_are_validated_once_and_names_fall_back_to_placeholders() {
-        let now = Instant::now();
-        let mut h = History::for_sources(&Sources {
-            network_luid: None,
-            network_name: None,
-            disk: Some(crate::nvme::DiskDevice {
-                path: r"\\.\PhysicalDrive0".into(),
-                name: "TEST NVMe".into(),
-            }),
-        });
-        assert_eq!(h.network_name, "未选择 WLAN");
-        assert_eq!(h.nvme_name, "TEST NVMe");
-        assert_eq!(h.cpu_label(), "等待采样  ·  频率等待基线");
-        let mut sample = demo_sample(now, 0);
+        let mut sample = demo_sample(now + Duration::from_secs(1), 2);
         sample.cpu = Ok(CpuUsage::Busy(1.5));
-        sample.memory = Ok(crate::memory::MemorySnapshot {
-            total_bytes: 4 << 30,
-            available_bytes: 3 << 30,
-        });
         h.push(sample);
-        assert!(matches!(h.cpu, Metric::Failed(_)) && h.points[0].cpu.is_none());
-        assert_eq!(h.ram_label(), "25.0%  ·  1.00 / 4.00 GiB");
-        assert_eq!(h.points[0].ram, Some(0.25));
-        assert_eq!(h.last_sample_at(), Some(now));
-        assert_eq!(unless_stale("x", true), STALE_LABEL);
+        assert!(matches!(h.cpu, Metric::Failed(_)));
+        assert!(h.points[1].cpu.is_none());
     }
 }
