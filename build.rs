@@ -44,6 +44,7 @@ fn main() {
         // 枚举网络接口；系统分配的表必须交回 FreeMibTable。
         "GetIfTable2",
         "FreeMibTable",
+        "IF_TYPE_ETHERNET_CSMACD",
         "IF_TYPE_IEEE80211",
         "IfOperStatusUp",
         "IfOperStatusDown",

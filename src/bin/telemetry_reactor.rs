@@ -355,12 +355,12 @@ impl Component for TelemetryPage {
                             info_card(
                                 "CPU / 估算频率",
                                 frequency_value,
-                                "PDH _Total 估算 · 非单核瞬时时钟".into(),
+                                "PDH _Total · 整机估算频率".into(),
                                 VIOLET,
                             ),
                             section_title("设备活动"),
                             info_card(
-                                "WLAN / 吞吐",
+                                "网络 / 吞吐",
                                 network_value,
                                 format!("选中接口：{} · 字节每秒", history.network_name),
                                 CYAN,
@@ -374,7 +374,7 @@ impl Component for TelemetryPage {
                             info_card(
                                 "GPU / 活动引擎",
                                 gpu_value,
-                                "最忙的单个进程/引擎实例 · 非整卡利用率".into(),
+                                "最忙的单个进程/引擎实例利用率".into(),
                                 VIOLET,
                             ),
                             info_card("NVMe / SMART", nvme_value, nvme_detail, GREEN),

@@ -70,7 +70,7 @@ pub fn help(binary: &str) -> String {
     format!(
         "用法：{binary} [--interface 名称] [--disk \\\\.\\PhysicalDriveN]\n\
          选项：\n\
-           --interface 名称  选择物理 WLAN 接口\n\
+           --interface 名称  选择物理 WLAN 或以太网接口\n\
            --disk 路径       选择 NVMe 物理磁盘\n\
            --list-network    列出网络接口\n\
            --list-disks      列出 NVMe 磁盘\n\

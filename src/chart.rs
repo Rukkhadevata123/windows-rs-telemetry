@@ -193,7 +193,7 @@ fn draw_compact(
     let lines = [
         format!("CPU  {}", unless_stale(&history.cpu_label(), sample_stale)),
         format!("内存  {}", unless_stale(&history.ram_label(), sample_stale)),
-        format!("WLAN  {}", unless_stale(&network_label, network_stale)),
+        format!("网络  {}", unless_stale(&network_label, network_stale)),
         format!("磁盘  {}", unless_stale(&history.disk_label, pdh_stale)),
         format!("GPU  {}", unless_stale(&history.gpu_label, pdh_stale)),
         format!("NVMe  {}", unless_stale(&history.nvme_label, nvme_stale)),
@@ -319,7 +319,7 @@ fn draw_full(
         &text,
     );
     line(
-        "磁盘：PhysicalDisk 总读写速率  ·  GPU：单个进程/引擎实例，不是整卡利用率",
+        "磁盘：PhysicalDisk 总读写速率  ·  GPU：最忙的单个进程/引擎实例利用率",
         &fonts.small,
         275.0,
         20.0,
@@ -415,7 +415,7 @@ fn draw_full(
     draw_series(session, &download, plot, &download_brush, maximum);
     draw_series(session, &upload, plot, &upload_brush, maximum);
     line(
-        "RAM：物理内存占比  ·  网络：仅选中接口，纵轴随历史峰值调整",
+        "RAM：物理内存占比  ·  网络：选中接口吞吐量，纵轴随历史峰值调整",
         &fonts.small,
         height - 24.0,
         20.0,

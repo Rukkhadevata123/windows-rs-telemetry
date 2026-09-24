@@ -2,9 +2,9 @@
 use std::{io, ptr, time::Instant};
 
 use crate::bindings::{
-    FreeMibTable, GetIfTable2, IF_OPER_STATUS, IF_TYPE_IEEE80211, IfOperStatusDormant,
-    IfOperStatusDown, IfOperStatusLowerLayerDown, IfOperStatusNotPresent, IfOperStatusTesting,
-    IfOperStatusUnknown, IfOperStatusUp, MIB_IF_ROW2, MIB_IF_TABLE2,
+    FreeMibTable, GetIfTable2, IF_OPER_STATUS, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211,
+    IfOperStatusDormant, IfOperStatusDown, IfOperStatusLowerLayerDown, IfOperStatusNotPresent,
+    IfOperStatusTesting, IfOperStatusUnknown, IfOperStatusUp, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use crate::sampling::MAX_SAMPLE_GAP;
 
@@ -17,6 +17,7 @@ pub struct InterfaceSnapshot {
     pub description: String,
     pub is_hardware: bool,
     pub is_wifi: bool,
+    pub is_ethernet: bool,
     pub oper_status: IF_OPER_STATUS,
     pub received_bytes: u64,
     pub sent_bytes: u64,
@@ -60,6 +61,7 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
                 description: utf16(&(*row).Description),
                 is_hardware: flags & 1 != 0, // HardwareInterface 是最低位。
                 is_wifi: (*row).Type == IF_TYPE_IEEE80211 as u32,
+                is_ethernet: (*row).Type == IF_TYPE_ETHERNET_CSMACD as u32,
                 oper_status: (*row).OperStatus,
                 received_bytes: (*row).InOctets,
                 sent_bytes: (*row).OutOctets,
@@ -91,16 +93,17 @@ fn utf16(value: &[u16]) -> String {
 
 pub fn print_interfaces() -> io::Result<()> {
     let interfaces = collect_interfaces()?;
-    println!("网络接口快照：累计字节，不是实时速度\n");
+    println!("网络接口累计收发字节（B）\n");
     for interface in &interfaces {
         println!("{} — {}", interface.name, interface.description);
         println!(
-            "  LUID={:#018x}  index={}  {}  硬件={}  WLAN={}",
+            "  LUID={:#018x}  index={}  {}  硬件={}  WLAN={}  以太网={}",
             interface.luid,
             interface.index,
             status_label(interface.oper_status),
             interface.is_hardware,
-            interface.is_wifi
+            interface.is_wifi,
+            interface.is_ethernet
         );
         println!(
             "  接收={} B  发送={} B",
@@ -109,11 +112,13 @@ pub fn print_interfaces() -> io::Result<()> {
     }
     if let Some(interface) = select_interface(&interfaces, None)? {
         println!(
-            "\n本次选择：{}（{}），LUID={:#018x}",
+            "\n默认选择：{}（{}），LUID={:#018x}",
             interface.name, interface.description, interface.luid
         );
     } else {
-        println!("\n没有唯一的物理 WLAN 接口；可用 --interface 名称 明确选择。");
+        println!(
+            "\n自动选择需要恰好一个物理 WLAN 或以太网接口；如有多个，请用 --interface 名称指定。"
+        );
     }
     Ok(())
 }
@@ -124,7 +129,7 @@ pub fn select_interface<'a>(
 ) -> io::Result<Option<&'a InterfaceSnapshot>> {
     let candidates: Vec<_> = interfaces
         .iter()
-        .filter(|i| i.is_hardware && i.is_wifi)
+        .filter(|i| i.is_hardware && (i.is_wifi || i.is_ethernet))
         .collect();
     let selected = if let Some(name) = requested_name {
         let normalized = name.to_lowercase();
@@ -136,7 +141,7 @@ pub fn select_interface<'a>(
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("未找到名为 {name:?} 的物理 WLAN 接口"),
+                        format!("未找到名为 {name:?} 的物理 WLAN 或以太网接口"),
                     )
                 })?,
         )
@@ -224,6 +229,7 @@ mod tests {
             description: name.into(),
             is_hardware: hardware,
             is_wifi: true,
+            is_ethernet: false,
             oper_status: IfOperStatusUp,
             received_bytes: 0,
             sent_bytes: 0,
@@ -231,11 +237,20 @@ mod tests {
     }
 
     #[test]
-    fn selection_requires_unique_physical_wifi_unless_named() {
+    fn selection_requires_unique_physical_network_interface_unless_named() {
+        let mut ethernet = interface("Ethernet", 2, true);
+        ethernet.is_wifi = false;
+        ethernet.is_ethernet = true;
+        let mut virtual_ethernet = interface("Virtual Ethernet", 3, false);
+        virtual_ethernet.is_wifi = false;
+        virtual_ethernet.is_ethernet = true;
+        let mut other = interface("Other", 4, true);
+        other.is_wifi = false;
         let interfaces = [
             interface("WLAN", 1, true),
-            interface("Wi-Fi 2", 2, true),
-            interface("Virtual", 3, false),
+            ethernet,
+            virtual_ethernet,
+            other,
         ];
         assert!(select_interface(&interfaces, None).unwrap().is_none());
         assert_eq!(
@@ -245,8 +260,23 @@ mod tests {
                 .luid,
             1
         );
-        assert!(select_interface(&interfaces, Some("virtual")).is_err());
+        assert_eq!(
+            select_interface(&interfaces, Some("ethernet"))
+                .unwrap()
+                .unwrap()
+                .luid,
+            2
+        );
+        assert!(select_interface(&interfaces, Some("Virtual Ethernet")).is_err());
+        assert!(select_interface(&interfaces, Some("Other")).is_err());
         assert!(select_interface(&interfaces[..1], None).unwrap().is_some());
+        assert_eq!(
+            select_interface(&interfaces[1..2], None)
+                .unwrap()
+                .unwrap()
+                .luid,
+            2
+        );
         assert!(select_interface(&[], None).unwrap().is_none());
     }
 
@@ -260,6 +290,7 @@ mod tests {
             description: "test".into(),
             is_hardware: true,
             is_wifi: true,
+            is_ethernet: false,
             oper_status: IfOperStatusUp,
             received_bytes: 100,
             sent_bytes: 200,

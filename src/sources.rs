@@ -33,7 +33,7 @@ pub fn select(config: &Config) -> io::Result<Sources> {
         Ok(interfaces) => network::select_interface(&interfaces, config.interface.as_deref())?
             .map(|selected| (selected.luid, selected.name.clone())),
         Err(error) if config.interface.is_none() => {
-            eprintln!("WLAN 枚举失败，继续显示其它指标：{error}");
+            eprintln!("网络接口枚举失败，继续显示其它指标：{error}");
             None
         }
         Err(error) => return Err(error),

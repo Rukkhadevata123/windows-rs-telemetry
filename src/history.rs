@@ -93,7 +93,7 @@ impl Default for History {
             cpu: Metric::Pending,
             cpu_mhz: Metric::Pending,
             memory: Metric::Pending,
-            network_name: "未选择 WLAN".into(),
+            network_name: "未选择网络接口".into(),
             network_status: PENDING_LABEL.into(),
             battery_at: None,
             battery_label: "等待电池采样".into(),

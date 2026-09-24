@@ -31,7 +31,7 @@ fn run_window(config: Config) -> Result<(), Box<dyn Error>> {
     let ui_view = Rc::clone(&view);
     let ui_latest = Arc::clone(&latest);
     let (window_width, window_height) = ui::initial_window_size();
-    let window = Window::new("系统监控 — CPU / 内存 / WLAN / 电池 / NVMe / 磁盘 / GPU")
+    let window = Window::new("系统监控 — CPU / 内存 / 网络 / 电池 / NVMe / 磁盘 / GPU")
         .size(window_width, window_height)
         .on_message(move |hwnd, msg, _wparam, lparam| match msg {
             ui::WM_APP_SAMPLE => {

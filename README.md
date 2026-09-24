@@ -1,6 +1,6 @@
 # Windows telemetry
 
-一个 Windows 桌面遥测程序，提供两个独立窗口入口：Win32 + Canvas 显示最近 60 秒的 CPU、内存和 WLAN 曲线；WinUI 3 + Reactor 显示自动刷新的指标卡片。两个入口共用采样、数据模型和设备选择代码。
+一个 Windows 桌面遥测程序，提供两个独立窗口入口：Win32 + Canvas 显示最近 60 秒的 CPU、内存和网络曲线；WinUI 3 + Reactor 显示自动刷新的指标卡片。两个入口共用采样、数据模型和设备选择代码。
 
 ## 构建与运行
 
@@ -26,18 +26,25 @@ cargo run --locked --features "reactor,console" --bin telemetry-reactor -- --hel
 ```text
 --list-network          列出网络接口
 --list-disks            列出 NVMe 设备
---interface 名称        选择物理 WLAN 接口
+--interface 名称        选择物理 WLAN 或以太网接口
 --disk 路径             选择 NVMe 物理磁盘，例如 \\.\PhysicalDrive0
 --help                  显示帮助
 ```
 
-程序按设备类别独立选择：每类只有一个候选时自动选择，也可用参数指定。枚举失败或候选不唯一时，其他指标仍可显示；指定无效设备会报错。设备编号可能变化，先用列表命令确认当前路径。
+程序按设备类别独立选择：只有一个物理 WLAN 或以太网接口时自动选择；有多个接口时，用 `--interface` 指定。接口名称取自 `--list-network` 输出每项的首行（破折号前），名称含空格时加引号，例如 `--interface "Ethernet 2"`；名称匹配不区分大小写。枚举失败或候选不唯一时，其他指标仍可显示；指定无效设备会报错。设备编号可能变化，先用列表命令确认当前路径。
+
+例如，先在终端列出接口，再启动窗口监控指定的以太网卡：
+
+```powershell
+cargo run --locked --features console --bin windows-rs-telemetry -- --list-network
+cargo run --locked --features console --bin windows-rs-telemetry -- --interface "Ethernet 2"
+```
 
 ## 读数含义
 
 - CPU 使用率来自 `GetSystemTimes` 的相邻样本差分。CPU 频率由 PDH `Processor Information(_Total)` 的基准频率和性能百分比估算，表示整机聚合读数。
 - 内存显示 Windows 可见物理内存的已用量和总量。
-- WLAN 吞吐量按选中接口累计字节数的相邻采样差分计算，单位 B/s，界面以 KiB/s 或 MiB/s 显示。
+- WLAN 或以太网吞吐量按选中接口累计字节数的相邻采样差分计算，单位 B/s，界面以 KiB/s 或 MiB/s 显示。
 - 磁盘读写速率来自 PDH `PhysicalDisk(_Total)`，汇总所有物理磁盘。GPU 百分比取最忙的单个进程/引擎实例利用率。
 - NVMe SMART 每 30 秒进行只读查询，显示复合温度、可用备用空间百分比、备用阈值、已用寿命估计及警告位。
 - 电池状态与电池侧充放电功率每 3 秒更新，正值表示充电，负值表示放电。
