@@ -3,7 +3,7 @@
 mod chart;
 mod ui;
 
-use std::{cell::RefCell, error::Error, rc::Rc, sync::Arc};
+use std::{cell::RefCell, error::Error, process::ExitCode, rc::Rc, sync::Arc};
 
 use windows_rs_telemetry::{
     config::Config,
@@ -13,7 +13,17 @@ use windows_rs_telemetry::{
 };
 use windows_window::Window;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("错误：{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     if let Some(config) = sources::handle_command_line("windows-rs-telemetry")? {
         run_window(config)?;
     }
@@ -45,7 +55,6 @@ fn run_window(config: Config) -> Result<(), Box<dyn Error>> {
                 // SAFETY：WM_PAINT 回调提供当前 UI 线程仍然有效的 HWND。
                 let result = unsafe { ui_view.borrow_mut().paint(hwnd) };
                 if let Err(error) = result {
-                    eprintln!("Canvas 绘制失败：{error}");
                     ui_view.borrow_mut().error = Some(error);
                     windows_window::quit();
                 }
@@ -64,7 +73,8 @@ fn run_window(config: Config) -> Result<(), Box<dyn Error>> {
             }
             _ => None,
         })
-        .create()?;
+        .create()
+        .map_err(|error| format!("创建监控窗口失败：{error}"))?;
 
     let waker = ui::UiWaker::new(window.hwnd());
     let sampler = SamplerThread::spawn(
@@ -78,7 +88,8 @@ fn run_window(config: Config) -> Result<(), Box<dyn Error>> {
                 latest.take();
             }
         },
-    )?;
+    )
+    .map_err(|error| format!("启动采样线程失败：{error}"))?;
 
     ui::request_redraw(window.hwnd());
     windows_window::run();
@@ -89,7 +100,7 @@ fn run_window(config: Config) -> Result<(), Box<dyn Error>> {
     drop(state);
     drop(window);
     if let Some(error) = error {
-        return Err(error.into());
+        return Err(format!("Canvas 绘制失败：{error}").into());
     }
     Ok(())
 }

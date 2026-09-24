@@ -213,7 +213,7 @@ fn validate_drive_path(path: &str) -> io::Result<()> {
         Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => Ok(()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            r"需要 \\.\PhysicalDriveN 路径",
+            r"磁盘路径格式应为 \\.\PhysicalDriveN，例如 \\.\PhysicalDrive0",
         )),
     }
 }
@@ -221,15 +221,36 @@ fn validate_drive_path(path: &str) -> io::Result<()> {
 pub fn select_disk(requested_path: Option<&str>) -> io::Result<Option<DiskDevice>> {
     if let Some(path) = requested_path {
         validate_drive_path(path)?;
-        let handle = open(path)?;
-        let name = query_device(&handle)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "指定路径不是 NVMe 盘"))?;
+        let handle = open(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("找不到磁盘 {path}；可用 --list-disks 查看可用设备"),
+                )
+            } else {
+                io::Error::new(error.kind(), format!("打开磁盘 {path} 失败：{error}"))
+            }
+        })?;
+        let name = query_device(&handle)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("读取磁盘 {path} 的设备信息失败：{error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("磁盘 {path} 需为 NVMe 设备；可用 --list-disks 查看可用设备"),
+                )
+            })?;
         return Ok(Some(DiskDevice {
             path: path.to_owned(),
             name,
         }));
     }
-    let disks = list_disks()?;
+    let disks = list_disks()
+        .map_err(|error| io::Error::new(error.kind(), format!("扫描 NVMe 磁盘失败：{error}")))?;
     Ok(if disks.len() == 1 {
         disks.into_iter().next()
     } else {

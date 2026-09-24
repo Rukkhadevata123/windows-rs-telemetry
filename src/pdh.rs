@@ -227,20 +227,20 @@ struct Adapter {
 fn adapters() -> Result<Vec<Adapter>, String> {
     // SAFETY: DXGI 返回由 COM 引用计数管理的工厂；接口均仅在本线程使用。
     let factory: dxgi::IDXGIFactory1 =
-        unsafe { dxgi::CreateDXGIFactory1() }.map_err(|e| format!("CreateDXGIFactory1: {e:?}"))?;
+        unsafe { dxgi::CreateDXGIFactory1() }.map_err(|e| format!("创建 GPU 设备列表失败：{e}"))?;
     let mut result = Vec::new();
     for index in 0..MAX_ADAPTERS {
         // SAFETY: 工厂仍有效；仅在本线程枚举。
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
             Ok(adapter) => adapter,
             Err(error) if error.code().0 as u32 == DXGI_ERROR_NOT_FOUND => break,
-            Err(error) => return Err(format!("EnumAdapters1: {error:?}")),
+            Err(error) => return Err(format!("枚举 GPU 适配器失败：{error}")),
         };
         let mut desc = dxgi::DXGI_ADAPTER_DESC1::default();
         // SAFETY: 完整的本地结构体输出。
         unsafe { adapter.GetDesc1(&mut desc) }
             .ok()
-            .map_err(|e| format!("GetDesc1: {e:?}"))?;
+            .map_err(|e| format!("读取 GPU 适配器信息失败：{e}"))?;
         if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE != 0 {
             continue;
         }

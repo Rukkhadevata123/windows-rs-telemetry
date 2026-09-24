@@ -4,6 +4,7 @@
 use std::{
     error::Error,
     io,
+    process::ExitCode,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, RecvTimeoutError},
@@ -391,10 +392,21 @@ impl Component for TelemetryPage {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("错误：{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     if let Some(config) = sources::handle_command_line("telemetry-reactor")? {
         let selected = sources::select(&config)?;
-        App::run_component::<TelemetryPage>(selected)?;
+        App::run_component::<TelemetryPage>(selected)
+            .map_err(|error| format!("启动 WinUI 窗口失败：{error}"))?;
     }
     Ok(())
 }

@@ -17,9 +17,13 @@ pub struct Sources {
 pub fn handle_command_line(binary: &str) -> io::Result<Option<Config>> {
     match Command::parse(std::env::args().skip(1)).map_err(io::Error::other)? {
         Command::Help => println!("{}", config::help(binary)),
-        Command::ListNetwork => network::print_interfaces()?,
+        Command::ListNetwork => network::print_interfaces()
+            .map_err(|error| io::Error::new(error.kind(), format!("列出网络接口失败：{error}")))?,
         Command::ListDisks => {
-            for disk in nvme::list_disks()? {
+            let disks = nvme::list_disks().map_err(|error| {
+                io::Error::new(error.kind(), format!("列出 NVMe 磁盘失败：{error}"))
+            })?;
+            for disk in disks {
                 println!("{}  {}", disk.path, disk.name);
             }
         }
@@ -36,7 +40,12 @@ pub fn select(config: &Config) -> io::Result<Sources> {
             eprintln!("网络接口枚举失败，继续显示其它指标：{error}");
             None
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("枚举网络接口失败：{error}"),
+            ));
+        }
     };
     let disk = match nvme::select_disk(config.disk.as_deref()) {
         Ok(selected) => selected,

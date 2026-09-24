@@ -36,7 +36,7 @@ impl Command {
                     }
                     config.disk = Some(value(&mut args, "--disk")?);
                 }
-                _ => return Err(format!("未知参数：{arg}；使用 --help 查看用法")),
+                _ => return Err(format!("无法识别参数 {arg}。请运行 --help 查看可用选项。")),
             }
         }
         if let Some(action) = action {
