@@ -415,7 +415,7 @@ mod tests {
         assert!(parse_smart(&bytes[..100]).is_err());
         let mut broken = descriptor;
         broken.ProtocolSpecificData.ProtocolDataOffset = 900;
-        // SAFETY：同上。
+        // SAFETY：目标切片足够容纳完整描述符；write_unaligned 不要求 u8 缓冲区对齐。
         unsafe {
             ptr::write_unaligned(
                 bytes

@@ -66,14 +66,13 @@ impl View {
 
     fn draw_frame(&mut self, hwnd: HWND) -> windows_canvas::Result<()> {
         let mut rect = RECT::default();
-        // SAFETY：窗口线程读取自己的有效 HWND，rect 是本地有效输出缓冲区。
-        unsafe {
-            if IsIconic(hwnd) != 0 {
-                return Ok(());
-            }
-            if GetClientRect(hwnd, &mut rect) == 0 {
-                return Err(windows_result::Error::from_thread());
-            }
+        // SAFETY：WM_PAINT 回调期间 hwnd 有效，并在当前窗口线程使用。
+        if unsafe { IsIconic(hwnd) } != 0 {
+            return Ok(());
+        }
+        // SAFETY：同一有效 hwnd；rect 是本地可写输出缓冲区。
+        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+            return Err(windows_result::Error::from_thread());
         }
         let width = (rect.right - rect.left).max(0) as u32;
         let height = (rect.bottom - rect.top).max(0) as u32;
@@ -108,11 +107,10 @@ impl View {
 
 /// 只标记更新区域，由消息循环合并重绘；最小化时继续采样但不绘图。
 pub fn request_redraw(hwnd: HWND) {
-    // SAFETY：两个 API 都会校验句柄；失效时只返回失败。
-    unsafe {
-        if IsIconic(hwnd) == 0 {
-            InvalidateRect(hwnd, std::ptr::null(), 0);
-        }
+    // SAFETY：只查询 hwnd 的窗口状态；句柄失效时 Win32 返回失败。
+    if unsafe { IsIconic(hwnd) } == 0 {
+        // SAFETY：传入的是窗口句柄值；Win32 校验失效句柄并返回失败。
+        unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
     }
 }
 

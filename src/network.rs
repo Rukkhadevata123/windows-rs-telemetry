@@ -42,19 +42,25 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
         return Err(io::Error::from_raw_os_error(status));
     }
     let table = InterfaceTable(raw);
+    // SAFETY：GetIfTable2 成功返回有效的表；Table 是变长尾数组的首行，
+    // NumEntries 给出实际行数。
+    let (first, count) = unsafe {
+        (
+            ptr::addr_of!((*table.0).Table).cast::<MIB_IF_ROW2>(),
+            (*table.0).NumEntries as usize,
+        )
+    };
     let mut interfaces = Vec::new();
-    // SAFETY：成功返回的表包含 NumEntries 行；按生成结构体定位首行并跨过对齐填充。
-    // Table 的 [ROW; 1] 是 C 可变长尾数组的占位；实际行数由 NumEntries 决定。
-    unsafe {
-        let first = ptr::addr_of!((*table.0).Table).cast::<MIB_IF_ROW2>();
-        for index in 0..(*table.0).NumEntries as usize {
+    for index in 0..count {
+        // SAFETY：GetIfTable2 分配的表在本循环中保持有效，包含 count 行。
+        let snapshot = unsafe {
             let row = first.add(index);
             // bindgen 0.100 把这组 8 个 BOOLEAN 位域生成为 bool，但原始字节可能 > 1。
             // 只读取字节及其他有效字段，不构造整行的 Rust 引用或读取那个 bool。
             let flags = ptr::addr_of!((*row).InterfaceAndOperStatusFlags)
                 .cast::<u8>()
                 .read();
-            interfaces.push(InterfaceSnapshot {
+            InterfaceSnapshot {
                 luid: (*row).InterfaceLuid.Value,
                 index: (*row).InterfaceIndex,
                 name: utf16(&(*row).Alias),
@@ -65,8 +71,9 @@ pub fn collect_interfaces() -> io::Result<Vec<InterfaceSnapshot>> {
                 oper_status: (*row).OperStatus,
                 received_bytes: (*row).InOctets,
                 sent_bytes: (*row).OutOctets,
-            });
-        }
+            }
+        };
+        interfaces.push(snapshot);
     }
     // 返回的 Vec/String/u64 都属于 Rust；table 在此离开作用域，释放系统表。
     Ok(interfaces)
